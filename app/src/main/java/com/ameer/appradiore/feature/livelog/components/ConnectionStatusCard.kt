@@ -4,6 +4,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -30,6 +32,7 @@ import com.ameer.appradiore.core.usb.StereoSpecs
 import com.ameer.appradiore.core.usb.UsbConnectionState
 import com.ameer.appradiore.ui.theme.AppRadioRETheme
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun ConnectionStatusCard(
     connectionState: UsbConnectionState,
@@ -91,12 +94,15 @@ fun ConnectionStatusCard(
 
             if (stereoSpecs.isIdentified) {
                 Spacer(modifier = Modifier.height(8.dp))
-                Row(
+                FlowRow(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    val displayVal = if (stereoSpecs.dpi > 0) "${stereoSpecs.width}x${stereoSpecs.height} (${stereoSpecs.dpi}DPI)" else "${stereoSpecs.width}x${stereoSpecs.height}"
-                    SpecBadge(label = "Display", value = displayVal)
+                    SpecBadge(label = "Screen", value = "${stereoSpecs.width}x${stereoSpecs.height}")
+                    if (stereoSpecs.dpi > 0) {
+                        SpecBadge(label = "DPI", value = "${stereoSpecs.dpi}")
+                    }
                     if (stereoSpecs.modelId != 0.toShort()) {
                         SpecBadge(label = "Model", value = "0x${String.format("%04X", stereoSpecs.modelId)}")
                     }
@@ -106,6 +112,9 @@ fun ConnectionStatusCard(
                     }
                     if (stereoSpecs.isParkingBrakeOn) {
                         SpecBadge(label = "Brake", value = "ON")
+                    }
+                    if (stereoSpecs.isHdmiConnected) {
+                        SpecBadge(label = "HDMI", value = "Connected")
                     }
                 }
             }
