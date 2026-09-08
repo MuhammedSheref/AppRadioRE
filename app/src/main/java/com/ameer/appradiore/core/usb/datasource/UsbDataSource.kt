@@ -7,6 +7,9 @@ import android.os.ParcelFileDescriptor
 import com.ameer.appradiore.core.error.DataError
 import com.ameer.appradiore.core.error.EmptyResult
 import com.ameer.appradiore.core.error.Result
+import com.ameer.appradiore.core.logging.LogDirection
+import com.ameer.appradiore.core.logging.LogRepository
+import com.ameer.appradiore.core.logging.ProtocolType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,6 +34,7 @@ interface UsbDataSource {
 
 class UsbDataSourceImpl(
     private val context: Context,
+    private val logRepository: LogRepository,
     private val scope: CoroutineScope
 ) : UsbDataSource {
 
@@ -76,6 +80,14 @@ class UsbDataSourceImpl(
                     val bytesRead = input.read(buffer)
                     if (bytesRead > 0) {
                         val data = buffer.copyOf(bytesRead)
+                        val hexPreview = data.take(64).joinToString(" ") { String.format("%02X", it) }
+                        val suffix = if (data.size > 64) " ... (${data.size} bytes total)" else ""
+                        logRepository.log(
+                            direction = LogDirection.INCOMING,
+                            protocol = ProtocolType.RAW,
+                            summary = "RX Raw USB Chunk (${data.size} bytes)",
+                            rawHex = hexPreview + suffix
+                        )
                         _incomingBytes.emit(data)
                     } else if (bytesRead < 0) {
                         break
@@ -93,6 +105,14 @@ class UsbDataSourceImpl(
     override suspend fun write(data: ByteArray): EmptyResult<DataError.Usb> = withContext(Dispatchers.IO) {
         val stream = outputStream ?: return@withContext Result.Error(DataError.Usb.STREAM_CLOSED)
         try {
+            val hexPreview = data.take(64).joinToString(" ") { String.format("%02X", it) }
+            val suffix = if (data.size > 64) " ... (${data.size} bytes total)" else ""
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.RAW,
+                summary = "TX Raw USB Chunk (${data.size} bytes)",
+                rawHex = hexPreview + suffix
+            )
             stream.write(data)
             stream.flush()
             Result.Success(Unit)

@@ -20,6 +20,7 @@ val coreUsbModule = module {
     single<UsbDataSource> {
         UsbDataSourceImpl(
             context = androidContext(),
+            logRepository = get(),
             scope = get()
         )
     }

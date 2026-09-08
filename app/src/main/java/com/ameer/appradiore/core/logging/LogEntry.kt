@@ -15,7 +15,9 @@ enum class ProtocolType {
     USB,
     PFORMAT,
     SAC,
-    WEBLINK
+    WEBLINK,
+    MTP,
+    RAW
 }
 
 data class LogEntry(

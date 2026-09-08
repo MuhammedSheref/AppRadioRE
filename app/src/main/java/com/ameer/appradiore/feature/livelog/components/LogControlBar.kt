@@ -60,6 +60,16 @@ fun LogControlBar(
                 label = { Text("WebLink", fontSize = 11.sp) }
             )
             FilterChip(
+                selected = selectedFilter == ProtocolType.MTP,
+                onClick = { onFilterSelected(ProtocolType.MTP) },
+                label = { Text("MTP", fontSize = 11.sp) }
+            )
+            FilterChip(
+                selected = selectedFilter == ProtocolType.RAW,
+                onClick = { onFilterSelected(ProtocolType.RAW) },
+                label = { Text("RAW", fontSize = 11.sp) }
+            )
+            FilterChip(
                 selected = selectedFilter == ProtocolType.USB,
                 onClick = { onFilterSelected(ProtocolType.USB) },
                 label = { Text("USB", fontSize = 11.sp) }
