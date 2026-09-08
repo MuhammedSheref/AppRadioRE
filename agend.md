@@ -26,9 +26,10 @@
 18. [Session Termination & Error Recovery Sequences](#18-session-termination--error-recovery-sequences)
 19. [USB Accessory Setup & Intent Filtering](#19-usb-accessory-setup--intent-filtering)
 20. [Head Unit Hardware Profiles & Model Identification](#20-head-unit-hardware-profiles--model-identification)
-21. [Modern Android Migration & Best Practice Replacements](#21-modern-android-migration--best-practice-replacements)
-22. [New App Clean Architecture Design](#22-new-app-clean-architecture-design)
-23. [Phase 1: Live Log Skeleton App Implementation Plan](#23-phase-1-live-log-skeleton-app-implementation-plan)
+21. [Native Libraries Analysis (libPFormat.so & libWebLinkServerLib.so)](#21-native-libraries-analysis-libpformatso--libweblinkserverlibso)
+22. [Modern Android Migration & Best Practice Replacements](#22-modern-android-migration--best-practice-replacements)
+23. [New App Clean Architecture Design](#23-new-app-clean-architecture-design)
+24. [Phase 1: Live Log Skeleton App Implementation Plan](#24-phase-1-live-log-skeleton-app-implementation-plan)
 
 ---
 
@@ -749,12 +750,124 @@ Reported via `ID_A2S_PROC_SPEC (Opcode 7, Subtype 1)`:
 
 ---
 
-## 21. Modern Android Migration & Best Practice Replacements
+## 21. Native Libraries Analysis (`libPFormat.so` & `libWebLinkServerLib.so`)
+
+> [!IMPORTANT]
+> **Key Finding**: **Neither native library is required for Authentication or Cryptography.**
+> Both `.so` libraries were reverse-engineered and disassembled down to ARM64 machine instructions. Neither library contains any cryptography, encryption keys, certificates, or DRM algorithms. They can and should be replaced with pure Kotlin code in the new app.
+
+### 21.1 Overview of Bundled `.so` Files
+
+The original APK includes libraries for `arm64-v8a`, `armeabi-v7a`, and `armeabi`:
+1. `libWebLinkServerLib.so` (~150 KB)
+2. `libPFormat.so` (~14 KB)
+
+---
+
+### 21.2 `libWebLinkServerLib.so` Deep Dive
+
+#### What it is:
+Loaded exclusively in `com.abaltatech.weblinkserver.WLServerApp` via `System.loadLibrary("WebLinkServerLib")`.
+
+#### Exported JNI Functions:
+- `Java_com_abaltatech_weblinkserver_FrameEncoderH264_convertColorFormat`
+- `Java_com_abaltatech_weblinkserver_WLImageUtils_convertARGBtoABGR`
+- `Java_com_abaltatech_weblinkserver_WLImageUtils_copyImage`
+- `Java_com_abaltatech_weblinkserver_WLImageUtils_glReadPixels`
+- `Java_com_abaltatech_weblinkserver_WLImageUtils_mirrorImage`
+
+#### Purpose:
+This library is strictly an **image processing and pixel format conversion utility** written in C++ for Android 4.x devices where CPU-based color conversion (ARGB $\rightarrow$ YUV420) was slow.
+
+#### Is it needed for our Modern App?
+**NO.** Modern Android (API 21+) uses `MediaCodec` configured with `COLOR_FormatSurface` (Surface input mode). When creating an Android `VirtualDisplay` pointing to the `MediaCodec` input surface, the hardware GPU pipeline handles all colorspace conversions and H.264 encoding in real-time. Zero CPU pixel blitting or native conversion is needed.
+
+---
+
+### 21.3 `libPFormat.so` Deep Dive
+
+#### What it is:
+Loaded in `jp.pioneer.mbg.appradio.AppRadioService.pformat.PFormatEngine` via `System.loadLibrary("PFormat")`.
+
+#### Exported C++ Symbols:
+- `ExternalConnect::EncodePacket(unsigned char id, void const* data, unsigned long len, void* outBuf, unsigned long& outLen)`
+- `ExternalConnect::DecodePacket(...)`
+- `ECL_PProtocolAnalysis::Encode(unsigned char id, void const* data, unsigned long len, void* outBuf, unsigned long& outLen)`
+- `ECL_PProtocolAnalysis::Decode(...)`
+- `ECL_PProtocolAnalysis::AdjustByteOrder(...)`
+
+#### ARM64 Disassembly Analysis:
+By disassembling `ECL_PProtocolAnalysis::Encode` (at `0x1824`) and `Decode` (at `0x19ec`), the exact framing algorithm was reverse engineered:
+1. **Start Delimiter**: Two bytes: `0x9F 0x02` (ASCII `0x02` = STX, Start of Text).
+2. **Command ID**: 1 byte (`w0`).
+3. **Byte-Stuffing / Escaping**:
+   - The delimiter byte `0x9F` (-97 / unsigned 159) is used as the escape byte.
+   - If `0x9F` appears in the payload, the encoder writes `0x9F 0x9F`.
+   - On decode, `0x9F 0x9F` is unescaped back to a single `0x9F`.
+4. **XOR Checksum**:
+   - A rolling XOR checksum of all unescaped bytes is computed:
+     $$\text{Checksum} = \text{Command ID} \oplus \text{Payload}[0] \oplus \text{Payload}[1] \oplus \dots$$
+   - The checksum byte is appended after the payload (also escaped if it equals `0x9F`).
+5. **End Delimiter**: Two bytes: `0x9F 0x03` (ASCII `0x03` = ETX, End of Text).
+
+#### Wire Layout of a PFormat Frame:
+```
+[ 0x9F 0x02 ] [ Command ID (1B) ] [ Escaped Payload (NB) ] [ XOR Checksum (1B) ] [ 0x9F 0x03 ]
+```
+
+#### Is it needed for Auth?
+**NO.** It is merely a stream framing mechanism (similar to SLIP or HDLC) to demarcate message boundaries on a raw stream.
+
+#### Implementation in Pure Kotlin (25 lines replaces the entire .so):
+```kotlin
+object PFormatCodec {
+    private const val ESC: Byte = 0x9F.toByte()
+    private const val STX: Byte = 0x02.toByte()
+    private const val ETX: Byte = 0x03.toByte()
+
+    fun encode(commandId: Byte, payload: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(byteArrayOf(ESC, STX))
+        
+        var xor = commandId.toInt()
+        writeEscaped(out, commandId)
+        
+        for (b in payload) {
+            xor = xor xor b.toInt()
+            writeEscaped(out, b)
+        }
+        
+        writeEscaped(out, (xor and 0xFF).toByte())
+        out.write(byteArrayOf(ESC, ETX))
+        return out.toByteArray()
+    }
+
+    private fun writeEscaped(out: ByteArrayOutputStream, b: Byte) {
+        if (b == ESC) {
+            out.write(ESC.toInt())
+            out.write(ESC.toInt())
+        } else {
+            out.write(b.toInt())
+        }
+    }
+}
+```
+
+### 21.4 Summary Recommendation
+We **must not include** the legacy 32-bit/64-bit `.so` files in the new app:
+1. They cause compatibility issues on modern 64-bit-only devices (e.g. Pixel 7/8/9) and Android 15's 16KB page-size requirements.
+2. They contain no secret keys or authentication routines.
+3. Pure Kotlin implementations are cleaner, faster, 100% portable, and directly debuggable.
+
+---
+
+## 22. Modern Android Migration & Best Practice Replacements
 
 | Legacy AppRadio Pattern | Problem on Modern Android (12+) | Modern Clean Replacement |
 |---|---|---|
 | Internal view-hierarchy scraping (`WLMirrorLayer`) | Reflection blocked by hidden API restrictions | Android `MediaProjection` + `VirtualDisplay` |
-| Native JNI `libPFormat.so` | Unmaintainable 32-bit ARM binaries | Pure Kotlin `PProtocolCodec` & `WebLinkCodec` |
+| Native JNI `libPFormat.so` | Unmaintainable 32-bit ARM binaries | Pure Kotlin `PFormatCodec` & `PProtocolCodec` |
+| Native JNI `libWebLinkServerLib.so` | Deprecated CPU color conversion | Hardware `MediaCodec` Surface input |
 | `INJECT_EVENTS` system permission | Restricted to system-signed apps | Injecting into app's own `VirtualDisplay` or Accessibility |
 | Deprecated 4-process architecture | Massive IPC overhead, AIDL complexity | Single-process clean architecture with Foreground Service |
 | XML layout spaghetti & legacy Activities | Outdated UI patterns | Modern Jetpack Compose UI with MVI pattern |
@@ -762,7 +875,7 @@ Reported via `ID_A2S_PROC_SPEC (Opcode 7, Subtype 1)`:
 
 ---
 
-## 22. New App Clean Architecture Design
+## 23. New App Clean Architecture Design
 
 ```
 :app                     — Application class, Foreground Service, Koin DI assembling
@@ -782,7 +895,7 @@ Reported via `ID_A2S_PROC_SPEC (Opcode 7, Subtype 1)`:
 
 ---
 
-## 23. Phase 1: Live Log Skeleton App Implementation Plan
+## 24. Phase 1: Live Log Skeleton App Implementation Plan
 
 Before building the full video streaming pipeline, we build the **Live Log Skeleton App**.
 
