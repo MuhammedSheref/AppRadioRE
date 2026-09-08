@@ -95,11 +95,18 @@ fun ConnectionStatusCard(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    SpecBadge(label = "Display", value = "${stereoSpecs.width}x${stereoSpecs.height}")
-                    SpecBadge(label = "Model", value = "0x${String.format("%04X", stereoSpecs.modelId)}")
+                    val displayVal = if (stereoSpecs.dpi > 0) "${stereoSpecs.width}x${stereoSpecs.height} (${stereoSpecs.dpi}DPI)" else "${stereoSpecs.width}x${stereoSpecs.height}"
+                    SpecBadge(label = "Display", value = displayVal)
+                    if (stereoSpecs.modelId != 0.toShort()) {
+                        SpecBadge(label = "Model", value = "0x${String.format("%04X", stereoSpecs.modelId)}")
+                    }
                     SpecBadge(label = "Touch", value = "${stereoSpecs.pointerCount} pts")
-                    SpecBadge(label = "GPS", value = if (stereoSpecs.hasGps) "Yes" else "No")
-                    SpecBadge(label = "Brake", value = if (stereoSpecs.isParkingBrakeOn) "ON" else "OFF")
+                    if (stereoSpecs.hasGps) {
+                        SpecBadge(label = "GPS", value = "Yes")
+                    }
+                    if (stereoSpecs.isParkingBrakeOn) {
+                        SpecBadge(label = "Brake", value = "ON")
+                    }
                 }
             }
         }

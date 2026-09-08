@@ -232,51 +232,75 @@ class HandshakeStateMachineImpl(
         )
 
         isMtpMode = true
-        if (packet.srcAddress.port != 0) {
-            stereoControlPort = packet.srcAddress.port
+        // Keep stereoControlPort locked to PORT_CONTROL_CHANNEL (12347)
+        stereoControlPort = MTPPacket.PORT_CONTROL_CHANNEL
+        if (packet.srcAddress.port == MTPPacket.PORT_CONTROL_CHANNEL) {
             stereoAddress = packet.srcAddress
         }
 
-        // Is it for Control Channel (port 12347)?
-        if (packet.dstAddress.port == MTPPacket.PORT_CONTROL_CHANNEL || packet.srcAddress.port == MTPPacket.PORT_CONTROL_CHANNEL) {
-            if (packet.payload.isEmpty()) {
-                // Empty payload is a channel SYN / connection probe from stereo
-                logRepository.log(
-                    direction = LogDirection.INTERNAL,
-                    protocol = ProtocolType.MTP,
-                    summary = "Control Channel connection requested by stereo. Sending ACK..."
-                )
-                val ack = MTPCodec.createConnectionAck(
-                    srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, MTPPacket.PORT_CONTROL_CHANNEL),
-                    dstAddress = packet.srcAddress
-                )
-                usbAccessoryManager.send(ack)
-                logRepository.log(
-                    direction = LogDirection.OUTGOING,
-                    protocol = ProtocolType.MTP,
-                    summary = "TX MTP Connection ACK sent to ${packet.srcAddress}"
-                )
-            } else {
-                // Decode PFormat inside MTP payload
-                val pFormatPackets = PFormatCodec.decode(packet.payload)
-                if (pFormatPackets.isNotEmpty()) {
-                    for (pPacket in pFormatPackets) {
-                        handlePFormatPacket(pPacket)
-                    }
-                } else {
-                    logRepository.log(
-                        direction = LogDirection.INTERNAL,
-                        protocol = ProtocolType.MTP,
-                        summary = "Unrecognized payload in Control Channel (${packet.payload.size} bytes)",
-                        rawHex = packet.payload.take(64).joinToString(" ") { String.format("%02X", it) }
-                    )
-                }
-            }
-        } else if (packet.dstAddress.port == MTPPacket.PORT_VIDEO_CHANNEL || packet.srcAddress.port == MTPPacket.PORT_VIDEO_CHANNEL) {
+        val isControl = packet.dstAddress.port == MTPPacket.PORT_CONTROL_CHANNEL || packet.srcAddress.port == MTPPacket.PORT_CONTROL_CHANNEL
+        val isVideo = packet.dstAddress.port == MTPPacket.PORT_VIDEO_CHANNEL || packet.srcAddress.port == MTPPacket.PORT_VIDEO_CHANNEL
+
+        if (packet.payload.isEmpty()) {
+            // Channel SYN / Connection request from stereo
+            val channelName = if (isVideo) "Video Channel (Port 12346)" else "Control Channel (Port 12347)"
             logRepository.log(
                 direction = LogDirection.INTERNAL,
                 protocol = ProtocolType.MTP,
-                summary = "Video Channel packet received (${packet.payload.size} bytes)"
+                summary = "$channelName connection requested by stereo. Sending ACK..."
+            )
+            val ackPort = if (isVideo) MTPPacket.PORT_VIDEO_CHANNEL else MTPPacket.PORT_CONTROL_CHANNEL
+            val ack = MTPCodec.createConnectionAck(
+                srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, ackPort),
+                dstAddress = packet.srcAddress
+            )
+            usbAccessoryManager.send(ack)
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.MTP,
+                summary = "TX MTP Connection ACK sent to ${packet.srcAddress}"
+            )
+            return
+        }
+
+        // Non-empty payload: could be WebLink ('WL' = 0x57, 0x4C) or PFormat (0x9F)
+        val activeChannelPort = if (isVideo) MTPPacket.PORT_VIDEO_CHANNEL else MTPPacket.PORT_CONTROL_CHANNEL
+
+        if (packet.payload.size >= 2 && packet.payload[0] == WebLinkCommand.MAGIC_BYTE1 && packet.payload[1] == WebLinkCommand.MAGIC_BYTE2) {
+            val webLinkCommands = WebLinkCodec.decode(packet.payload)
+            if (webLinkCommands.isNotEmpty()) {
+                for (cmd in webLinkCommands) {
+                    handleWebLinkCommand(cmd, channelPort = activeChannelPort, srcAddr = packet.srcAddress)
+                }
+            } else {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.WEBLINK,
+                    summary = "Failed to parse WebLink command payload (${packet.payload.size} bytes)",
+                    rawHex = packet.payload.take(64).joinToString(" ") { String.format("%02X", it) }
+                )
+            }
+        } else if (packet.payload.isNotEmpty() && packet.payload[0] == PFormatCodec.ESC) {
+            val pFormatPackets = PFormatCodec.decode(packet.payload)
+            if (pFormatPackets.isNotEmpty()) {
+                for (pPacket in pFormatPackets) {
+                    handlePFormatPacket(pPacket)
+                }
+            } else {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Incomplete/corrupted PFormat frame inside MTP (${packet.payload.size} bytes)",
+                    rawHex = packet.payload.take(64).joinToString(" ") { String.format("%02X", it) }
+                )
+            }
+        } else {
+            val channelName = if (isVideo) "Video Channel" else "Control Channel"
+            logRepository.log(
+                direction = LogDirection.INTERNAL,
+                protocol = ProtocolType.MTP,
+                summary = "Unrecognized payload in $channelName (${packet.payload.size} bytes)",
+                rawHex = packet.payload.take(64).joinToString(" ") { String.format("%02X", it) }
             )
         }
     }
@@ -376,13 +400,113 @@ class HandshakeStateMachineImpl(
         }
     }
 
-    private fun handleWebLinkCommand(cmd: WebLinkCommand) {
+    private suspend fun handleWebLinkCommand(
+        cmd: WebLinkCommand,
+        channelPort: Int = MTPPacket.PORT_VIDEO_CHANNEL,
+        srcAddr: MTPAddress? = null
+    ) {
         logRepository.log(
             direction = LogDirection.INCOMING,
             protocol = ProtocolType.WEBLINK,
             summary = "RX WebLink: ${cmd::class.simpleName} (ID: 0x${String.format("%04X", cmd.commandId)})",
             details = cmd.toString()
         )
+
+        when (cmd) {
+            is WebLinkCommand.DisplayMetrics -> {
+                _stereoSpecs.value = _stereoSpecs.value.copy(dpi = cmd.xdpi)
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.WEBLINK,
+                    summary = "Stereo Display Metrics: ${cmd.xdpi}x${cmd.ydpi} DPI"
+                )
+            }
+            is WebLinkCommand.SyncSessionTime -> {
+                val serverTime = System.currentTimeMillis()
+                val reply = WebLinkCommand.SyncSessionTime(
+                    clientTime = cmd.clientTime,
+                    serverTime = serverTime
+                )
+                val replyBytes = WebLinkCodec.encode(reply)
+                val replyHex = replyBytes.joinToString(" ") { String.format("%02X", it) }
+                logRepository.log(
+                    direction = LogDirection.OUTGOING,
+                    protocol = ProtocolType.WEBLINK,
+                    summary = "TX WebLink: SyncSessionTime Reply (clientTime=${cmd.clientTime}, serverTime=$serverTime)",
+                    rawHex = replyHex
+                )
+                if (isMtpMode) {
+                    val wireBytes = MTPCodec.wrapPayload(
+                        payload = replyBytes,
+                        srcPort = channelPort,
+                        dstPort = channelPort
+                    )
+                    usbAccessoryManager.send(wireBytes)
+                } else {
+                    usbAccessoryManager.send(replyBytes)
+                }
+            }
+            is WebLinkCommand.VideoConfig -> {
+                val w = cmd.clientWidth.takeIf { it > 0 } ?: cmd.sourceWidth
+                val h = cmd.clientHeight.takeIf { it > 0 } ?: cmd.sourceHeight
+                _stereoSpecs.value = _stereoSpecs.value.copy(
+                    width = w,
+                    height = h,
+                    isReadyForVideo = true
+                )
+
+                // Cancel auth retry loop since stereo established WebLink session
+                authJob?.cancel()
+                authJob = null
+
+                // Reply confirming video config: 800x480 H.264
+                val reply = WebLinkCommand.VideoConfig(
+                    sourceWidth = cmd.sourceWidth,
+                    sourceHeight = cmd.sourceHeight,
+                    clientWidth = cmd.clientWidth,
+                    clientHeight = cmd.clientHeight,
+                    frameEncoding = 2, // H.264
+                    encoderParams = "maxKeyFrameInterval=60,bitrate=8388608"
+                )
+                val replyBytes = WebLinkCodec.encode(reply)
+                val replyHex = replyBytes.take(64).joinToString(" ") { String.format("%02X", it) }
+                logRepository.log(
+                    direction = LogDirection.OUTGOING,
+                    protocol = ProtocolType.WEBLINK,
+                    summary = "TX WebLink: VideoConfig Confirm (${w}x${h}, H.264 @ 8Mbps)",
+                    rawHex = replyHex
+                )
+                if (isMtpMode) {
+                    val wireBytes = MTPCodec.wrapPayload(
+                        payload = replyBytes,
+                        srcPort = channelPort,
+                        dstPort = channelPort
+                    )
+                    usbAccessoryManager.send(wireBytes)
+                } else {
+                    usbAccessoryManager.send(replyBytes)
+                }
+
+                _currentStep.value = HandshakeStep.CONNECTED_READY
+                val dpiText = if (_stereoSpecs.value.dpi > 0) " @ ${_stereoSpecs.value.dpi} DPI" else ""
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "=== HANDSHAKE COMPLETE: Stereo Display Unlocked (${w}x${h}$dpiText) ==="
+                )
+                startHeartbeat()
+            }
+            is WebLinkCommand.Touch -> {
+                val pt = cmd.points.firstOrNull()
+                val ptStr = if (pt != null) " at (${pt.x}, ${pt.y})" else ""
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.WEBLINK,
+                    summary = "Stereo Touch Event: type=${cmd.eventType}$ptStr"
+                )
+            }
+            else -> Unit
+        }
     }
 
     private fun startHeartbeat() {
@@ -390,8 +514,8 @@ class HandshakeStateMachineImpl(
         heartbeatJob = scope.launch {
             while (isActive) {
                 delay(5000)
-                // Heartbeat packet / status query
-                if (_currentStep.value == HandshakeStep.CONNECTED_READY) {
+                // Heartbeat packet / status query (SAC only)
+                if (_currentStep.value == HandshakeStep.CONNECTED_READY && !isMtpMode) {
                     sendSacCommand(SACCommand.RequestAccessoryStatus)
                 }
             }

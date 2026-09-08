@@ -9,7 +9,8 @@ data class StereoSpecs(
     val hasRemoteControl: Boolean = false,
     val isParkingBrakeOn: Boolean = false,
     val isHdmiConnected: Boolean = false,
-    val isReadyForVideo: Boolean = false
+    val isReadyForVideo: Boolean = false,
+    val dpi: Int = 0
 ) {
     val isIdentified: Boolean
         get() = width > 0 && height > 0
