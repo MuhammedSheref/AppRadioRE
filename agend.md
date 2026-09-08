@@ -958,29 +958,42 @@ Step 4: Jetpack Compose Diagnostic UI
 
 2. **In-Car Hardware Testing & Protocol Breakthrough**:
    - Physical USB AOA connection verified on car stereo hardware (`Pioneer jp.pioneer.ce.aam2.linkwith v1.0`).
-   - Discovered and documented the missing **MTP (Multi-Transport Protocol)** transport encapsulation required by the car stereo over USB AOA.
+   - Discovered and confirmed that Pioneer stereo runs **WebLink-over-MTP**:
+     - Port `12346`: Video streaming channel.
+     - Port `12347`: Control & input channel.
+   - **Stereo Screen Specs Unlocked from Physical Hardware**:
+     - Resolution: `800 x 480`
+     - Density: `240 DPI` (`xdpi=240|ydpi=240`, WebLink Command 75)
+     - Video Encoding: `H.264` (`frameEncoding = 2`, WebLink Command 32)
+     - Bitrate: `8,388,608 bps` (8 Mbps)
+     - Keyframe Interval: `maxKeyFrameInterval=60`
 
 3. **Abalta MTP Framing Codec (`core.protocol.mtp`)**:
    - Implemented `MTPPacket.kt` with 7-byte IPv4 addresses and options bitfields.
-   - Implemented `MTPCodec.kt` with stream-safe frame un-framing, unconsumed buffer retention, port 12347 control channel encapsulation, and connection ACKs.
+   - Implemented `MTPCodec.kt` with stream-safe frame un-framing, unconsumed buffer retention, port 12347 control channel encapsulation, generic `wrapPayload()`, and connection ACKs.
 
-4. **Zero-Blind-Spot Raw Wire Logging (`core.usb`)**:
-   - `UsbDataSourceImpl` now immediately logs every raw received chunk (`[RX] [RAW]`) and transmitted chunk (`[TX] [RAW]`) with full byte length and hex preview.
-   - Added `MTP` and `RAW` filter chips to `LogControlBar`.
+4. **WebLink Protocol Engine & Handshake Automation (`core.protocol.weblink`)**:
+   - Expanded `WebLinkCommand.kt` with full Abalta `VideoConfig` (5-int + string params), `DisplayMetrics` (ID 75), and `SyncSessionTime` (ID 73).
+   - Added complete Little-Endian encoder/decoder in `WebLinkCodec.kt`.
+   - Automated handshake responses in `HandshakeStateMachine.kt`:
+     - Immediate MTP Connection ACK on Port 12346 and Port 12347.
+     - Automated `SyncSessionTime` time sync reply with phone timestamp.
+     - Automated `VideoConfig` confirmation reply (`800x480 H.264 @ 8Mbps`).
+     - Screen unlocking transitions state to `CONNECTED_READY` and updates `StereoSpecs` (`800x480 @ 240 DPI`).
 
-5. **Adaptive State Machine (`HandshakeStateMachine.kt`)**:
-   - Dual-mode stream parser: handles both MTP-encapsulated frames and bare PFormat frames.
-   - Automated MTP ACK replies to stereo probe packets.
-   - 1000ms delay and 3-second retry loop (up to 3 attempts, matching `AccessoryAuthor.java`).
+5. **Zero-Blind-Spot Raw Wire Logging (`core.usb`)**:
+   - `UsbDataSourceImpl` logs every raw received chunk (`[RX] [RAW]`) and transmitted chunk (`[TX] [RAW]`) with byte length and hex dump.
+   - `ConnectionStatusCard` dynamically displays screen resolution with DPI badge (e.g. `800x480 (240DPI)`).
 
 ### 25.2 Test Coverage & Verification
-- **Automated Tests**: 39 of 39 unit tests passing across codecs, logging, state machine, and ViewModel (`./gradlew testDebugUnitTest`).
-- **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` ready for live vehicle testing.
+- **Automated Tests**: 43 of 43 unit tests passing across codecs, logging, state machine, and ViewModel (`./gradlew testDebugUnitTest`).
+- **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` built and ready for physical hardware verification.
 
 ### 25.3 Git Commit History
 - `9f74f6a`: `feat(protocol): introduce Abalta MTP framing codec and packet definitions`
 - `8adee3b`: `feat(logging): add raw USB chunk logging and protocol filter chips`
 - `340b120`: `feat(handshake): integrate MTP transport framing and 3-second retry loop`
+- `e508fa9`: `docs: update agend.md with MTP framing discoveries and completed milestones`
 - `f5e444f`: `refactor(di): modularize Koin definitions and add LiveLogViewModel Turbine unit tests`
 - `d27f810`: `refactor(ui): modularize LiveLogScreen into previewable components and add Immutable state annotation`
 - `9843f9e`: `refactor(usb): isolate AOA stream I/O into UsbDataSource and handle errors via Result`
@@ -989,4 +1002,4 @@ Step 4: Jetpack Compose Diagnostic UI
 
 ---
 
-> **Document Status**: Live, updated with MTP wire transport findings and Phase 1 completion milestones. Ready for on-vehicle verification.
+> **Document Status**: Live, updated with WebLink-over-MTP display unlock confirmation and session completion implementation. Ready for physical hardware testing.
