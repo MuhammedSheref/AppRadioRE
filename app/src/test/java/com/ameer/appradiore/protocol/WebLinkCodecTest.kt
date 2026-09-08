@@ -72,4 +72,63 @@ class WebLinkCodecTest {
         assertEquals(400, touch.points[0].x)
         assertEquals(240, touch.points[0].y)
     }
+
+    @Test
+    fun testVideoConfigRoundTrip() {
+        val config = WebLinkCommand.VideoConfig(
+            sourceWidth = 800,
+            sourceHeight = 480,
+            clientWidth = 800,
+            clientHeight = 480,
+            frameEncoding = 2,
+            encoderParams = "maxKeyFrameInterval=60,bitrate=8388608"
+        )
+        val encoded = WebLinkCodec.encode(config)
+        val decoded = WebLinkCodec.decode(encoded)
+
+        assertEquals(1, decoded.size)
+        assertTrue(decoded[0] is WebLinkCommand.VideoConfig)
+        val result = decoded[0] as WebLinkCommand.VideoConfig
+        assertEquals(800, result.sourceWidth)
+        assertEquals(480, result.sourceHeight)
+        assertEquals(800, result.clientWidth)
+        assertEquals(480, result.clientHeight)
+        assertEquals(2, result.frameEncoding)
+        assertEquals("maxKeyFrameInterval=60,bitrate=8388608", result.encoderParams)
+    }
+
+    @Test
+    fun testDecodeDisplayMetricsFromHardware() {
+        // Wire bytes from physical Pioneer stereo:
+        // 'W' 'L' [0x004B] [size=26] [0,0,0,0] [17,0,0,0] "xdpi=240|ydpi=240\0"
+        val header = byteArrayOf(0x57, 0x4C, 0x4B, 0x00, 0x1A, 0x00, 0x00, 0x00)
+        val payload = byteArrayOf(
+            0x00, 0x00, 0x00, 0x00,
+            0x11, 0x00, 0x00, 0x00
+        ) + "xdpi=240|ydpi=240\u0000".toByteArray()
+        val packet = header + payload
+
+        val decoded = WebLinkCodec.decode(packet)
+        assertEquals(1, decoded.size)
+        assertTrue(decoded[0] is WebLinkCommand.DisplayMetrics)
+        val metrics = decoded[0] as WebLinkCommand.DisplayMetrics
+        assertEquals(240, metrics.xdpi)
+        assertEquals(240, metrics.ydpi)
+    }
+
+    @Test
+    fun testSyncSessionTimeRoundTrip() {
+        val sync = WebLinkCommand.SyncSessionTime(
+            clientTime = 1788887642498L,
+            serverTime = 1788887642510L
+        )
+        val encoded = WebLinkCodec.encode(sync)
+        val decoded = WebLinkCodec.decode(encoded)
+
+        assertEquals(1, decoded.size)
+        assertTrue(decoded[0] is WebLinkCommand.SyncSessionTime)
+        val result = decoded[0] as WebLinkCommand.SyncSessionTime
+        assertEquals(1788887642498L, result.clientTime)
+        assertEquals(1788887642510L, result.serverTime)
+    }
 }

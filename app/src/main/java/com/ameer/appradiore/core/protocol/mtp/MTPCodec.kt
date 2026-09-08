@@ -165,6 +165,18 @@ object MTPCodec {
         dstPort: Int = MTPPacket.PORT_CONTROL_CHANNEL,
         isLast: Boolean = true
     ): ByteArray {
+        return wrapPayload(payload, srcPort, dstPort, isLast)
+    }
+
+    /**
+     * Wraps an arbitrary payload into an MTP TCP Data Packet targeting a specified source and destination port.
+     */
+    fun wrapPayload(
+        payload: ByteArray,
+        srcPort: Int,
+        dstPort: Int,
+        isLast: Boolean = true
+    ): ByteArray {
         val packet = MTPPacket.createDataPacket(
             srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, srcPort),
             dstAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, dstPort),

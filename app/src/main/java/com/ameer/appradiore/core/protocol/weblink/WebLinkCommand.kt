@@ -26,11 +26,22 @@ sealed class WebLinkCommand {
     }
 
     data class VideoConfig(
-        val clientWidth: Int,
-        val clientHeight: Int,
-        val encodingType: Int
+        val sourceWidth: Int = 800,
+        val sourceHeight: Int = 480,
+        val clientWidth: Int = 800,
+        val clientHeight: Int = 480,
+        val frameEncoding: Int = 2, // 2 = H.264
+        val encoderParams: String = ""
     ) : WebLinkCommand() {
         override val commandId: Short = ID_VIDEO_CONFIG
+    }
+
+    data class DisplayMetrics(
+        val xdpi: Int = 240,
+        val ydpi: Int = 240,
+        val rawMetrics: String = "xdpi=240|ydpi=240"
+    ) : WebLinkCommand() {
+        override val commandId: Short = ID_DISPLAY_METRICS
     }
 
     data class FillRectangle(
@@ -117,5 +128,6 @@ sealed class WebLinkCommand {
         const val ID_SET_FPS: Short = 71
         const val ID_TOUCH_COMMAND: Short = 72
         const val ID_SYNC_SESSION_TIME: Short = 73
+        const val ID_DISPLAY_METRICS: Short = 75
     }
 }

@@ -35,6 +35,28 @@ object WebLinkCodec {
                 buf.put(cmd.frameData)
                 buf.array()
             }
+            is WebLinkCommand.VideoConfig -> {
+                val paramBytes = cmd.encoderParams.toByteArray(StandardCharsets.UTF_8)
+                val buf = ByteBuffer.allocate(20 + paramBytes.size).order(ByteOrder.LITTLE_ENDIAN)
+                buf.putInt(cmd.sourceWidth)
+                buf.putInt(cmd.sourceHeight)
+                buf.putInt(cmd.clientWidth)
+                buf.putInt(cmd.clientHeight)
+                buf.putInt(cmd.frameEncoding)
+                if (paramBytes.isNotEmpty()) {
+                    buf.put(paramBytes)
+                }
+                buf.array()
+            }
+            is WebLinkCommand.DisplayMetrics -> {
+                val strBytes = cmd.rawMetrics.toByteArray(StandardCharsets.UTF_8)
+                val buf = ByteBuffer.allocate(8 + strBytes.size + 1).order(ByteOrder.LITTLE_ENDIAN)
+                buf.putInt(0)
+                buf.putInt(strBytes.size + 1)
+                buf.put(strBytes)
+                buf.put(0.toByte())
+                buf.array()
+            }
             is WebLinkCommand.BrowserAction -> {
                 ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(cmd.action).array()
             }
@@ -96,10 +118,57 @@ object WebLinkCodec {
                     WebLinkCommand.SetFps(buf.int)
                 }
                 WebLinkCommand.ID_VIDEO_CONFIG -> {
-                    val w = buf.int
-                    val h = buf.int
+                    val srcW = buf.int
+                    val srcH = buf.int
+                    val clientW = if (buf.remaining() >= 4) buf.int else srcW
+                    val clientH = if (buf.remaining() >= 4) buf.int else srcH
                     val enc = if (buf.remaining() >= 4) buf.int else 2
-                    WebLinkCommand.VideoConfig(w, h, enc)
+                    val params = if (buf.remaining() > 0) {
+                        val pBytes = ByteArray(buf.remaining())
+                        buf.get(pBytes)
+                        String(pBytes, StandardCharsets.UTF_8).trimEnd('\u0000')
+                    } else {
+                        ""
+                    }
+                    WebLinkCommand.VideoConfig(
+                        sourceWidth = srcW,
+                        sourceHeight = srcH,
+                        clientWidth = clientW,
+                        clientHeight = clientH,
+                        frameEncoding = enc,
+                        encoderParams = params
+                    )
+                }
+                WebLinkCommand.ID_DISPLAY_METRICS -> {
+                    var xdpi = 240
+                    var ydpi = 240
+                    var rawMetrics = ""
+                    if (buf.remaining() >= 8) {
+                        buf.int // skip reserved int
+                        val strLen = buf.int
+                        if (buf.remaining() >= strLen && strLen > 0) {
+                            val strBytes = ByteArray(strLen)
+                            buf.get(strBytes)
+                            rawMetrics = String(strBytes, StandardCharsets.UTF_8).trimEnd('\u0000')
+                        }
+                    } else if (buf.remaining() > 0) {
+                        val strBytes = ByteArray(buf.remaining())
+                        buf.get(strBytes)
+                        rawMetrics = String(strBytes, StandardCharsets.UTF_8).trimEnd('\u0000')
+                    }
+                    if (rawMetrics.isNotEmpty()) {
+                        val parts = rawMetrics.split("|")
+                        for (part in parts) {
+                            val kv = part.split("=")
+                            if (kv.size == 2) {
+                                when (kv[0].trim()) {
+                                    "xdpi" -> xdpi = kv[1].trim().toIntOrNull() ?: xdpi
+                                    "ydpi" -> ydpi = kv[1].trim().toIntOrNull() ?: ydpi
+                                }
+                            }
+                        }
+                    }
+                    WebLinkCommand.DisplayMetrics(xdpi, ydpi, rawMetrics)
                 }
                 WebLinkCommand.ID_SET_CURRENT_APP -> {
                     WebLinkCommand.SetCurrentApp(String(payload, StandardCharsets.UTF_8))
