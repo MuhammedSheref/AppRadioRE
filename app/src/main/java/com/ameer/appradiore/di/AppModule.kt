@@ -6,6 +6,7 @@ val appModule = module {
     includes(
         coreLoggingModule,
         coreUsbModule,
+        coreVideoModule,
         featureLiveLogModule
     )
 }

@@ -494,6 +494,36 @@ class HandshakeStateMachineImpl(
                     protocol = ProtocolType.SYSTEM,
                     summary = "=== HANDSHAKE COMPLETE: Stereo Display Unlocked (${w}x${h}$dpiText) ==="
                 )
+
+                // Trigger stereo mirror screen: SetCurrentApp("wlhome_1.0://")
+                val setAppCmd = WebLinkCommand.SetCurrentApp(appId = "wlhome_1.0://", appParams = "")
+                val setAppBytes = WebLinkCodec.encode(setAppCmd)
+                val setAppHex = setAppBytes.take(64).joinToString(" ") { String.format("%02X", it) }
+                logRepository.log(
+                    direction = LogDirection.OUTGOING,
+                    protocol = ProtocolType.WEBLINK,
+                    summary = "TX WebLink: SetCurrentApp (\"wlhome_1.0://\") -> Activate Mirror Screen",
+                    rawHex = setAppHex
+                )
+                if (isMtpMode) {
+                    val setAppMtpVideo = MTPCodec.wrapPayload(
+                        payload = setAppBytes,
+                        srcPort = channelPort,
+                        dstPort = channelPort
+                    )
+                    usbAccessoryManager.send(setAppMtpVideo)
+                    if (channelPort != MTPPacket.PORT_CONTROL_CHANNEL) {
+                        val setAppMtpControl = MTPCodec.wrapControlChannelPayload(
+                            payload = setAppBytes,
+                            srcPort = MTPPacket.PORT_CONTROL_CHANNEL,
+                            dstPort = MTPPacket.PORT_CONTROL_CHANNEL
+                        )
+                        usbAccessoryManager.send(setAppMtpControl)
+                    }
+                } else {
+                    usbAccessoryManager.send(setAppBytes)
+                }
+
                 startHeartbeat()
             }
             is WebLinkCommand.Touch -> {
