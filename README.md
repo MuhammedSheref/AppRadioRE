@@ -1,5 +1,6 @@
 # AppRadio RE (Reverse Engineered)
 
+[![Build Android APK](https://github.com/MuhammedSheref/AppRadioRE/actions/workflows/build-apk.yml/badge.svg)](https://github.com/MuhammedSheref/AppRadioRE/actions/workflows/build-apk.yml)
 [![Kotlin](https://img.shields.io/badge/Kotlin-2.0.0-purple.svg?style=flat&logo=kotlin)](https://kotlinlang.org)
 [![Android](https://img.shields.io/badge/Platform-Android_8.0+_(API_26+)-green.svg?style=flat&logo=android)](https://www.android.com)
 [![Compose](https://img.shields.io/badge/UI-Jetpack_Compose_Material3-blue.svg?style=flat&logo=jetpackcompose)](https://developer.android.com/jetpack/compose)
@@ -129,7 +130,7 @@ AppRadioRE/
 Clone the repository and build via Gradle:
 
 ```bash
-git clone https://github.com/yourusername/AppRadioRE.git
+git clone https://github.com/MuhammedSheref/AppRadioRE.git
 cd AppRadioRE
 
 # Run all unit tests
