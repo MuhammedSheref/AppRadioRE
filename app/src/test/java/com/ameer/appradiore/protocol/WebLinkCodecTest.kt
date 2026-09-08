@@ -23,24 +23,48 @@ class WebLinkCodecTest {
         bb.position(2)
         val cmdId = bb.short
         val len = bb.int
-        val fps = bb.int
-
         assertEquals(WebLinkCommand.ID_SET_FPS, cmdId)
-        assertEquals(4, len)
+        assertEquals(1, len)
+        val fps = bb.get().toInt()
         assertEquals(30, fps)
     }
 
     @Test
     fun testRoundTripSetCurrentApp() {
-        val appUri = "weblink://com.ameer.appradiore"
-        val cmd = WebLinkCommand.SetCurrentApp(appUri)
+        val appId = "wlhome_1.0://"
+        val appParams = "param=test"
+        val cmd = WebLinkCommand.SetCurrentApp(appId, appParams)
         val encoded = WebLinkCodec.encode(cmd)
 
         val decodedList = WebLinkCodec.decode(encoded)
         assertEquals(1, decodedList.size)
         assertTrue(decodedList[0] is WebLinkCommand.SetCurrentApp)
         val decodedCmd = decodedList[0] as WebLinkCommand.SetCurrentApp
-        assertEquals(appUri, decodedCmd.appUri)
+        assertEquals(appId, decodedCmd.appId)
+        assertEquals(appParams, decodedCmd.appParams)
+    }
+
+    @Test
+    fun testFillRectangleRoundTrip() {
+        val dummyH264 = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F)
+        val cmd = WebLinkCommand.FillRectangle(
+            width = 800,
+            height = 480,
+            encodingType = 2,
+            appId = 0,
+            frameData = dummyH264
+        )
+        val encoded = WebLinkCodec.encode(cmd)
+        val decodedList = WebLinkCodec.decode(encoded)
+
+        assertEquals(1, decodedList.size)
+        assertTrue(decodedList[0] is WebLinkCommand.FillRectangle)
+        val decodedCmd = decodedList[0] as WebLinkCommand.FillRectangle
+        assertEquals(800, decodedCmd.width)
+        assertEquals(480, decodedCmd.height)
+        assertEquals(2, decodedCmd.encodingType)
+        assertEquals(0, decodedCmd.appId)
+        assertTrue(dummyH264.contentEquals(decodedCmd.frameData))
     }
 
     @Test

@@ -10,7 +10,10 @@ import java.nio.ByteOrder
 sealed class WebLinkCommand {
     abstract val commandId: Short
 
-    data class SetCurrentApp(val appUri: String = "wlhome_1.0://") : WebLinkCommand() {
+    data class SetCurrentApp(
+        val appId: String = "wlhome_1.0://",
+        val appParams: String = ""
+    ) : WebLinkCommand() {
         override val commandId: Short = ID_SET_CURRENT_APP
     }
 

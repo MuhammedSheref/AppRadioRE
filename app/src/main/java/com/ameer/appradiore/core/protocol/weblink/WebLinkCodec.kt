@@ -15,10 +15,21 @@ object WebLinkCodec {
     fun encode(cmd: WebLinkCommand): ByteArray {
         val payload = when (cmd) {
             is WebLinkCommand.SetCurrentApp -> {
-                cmd.appUri.toByteArray(StandardCharsets.UTF_8)
+                val idBytes = cmd.appId.toByteArray(StandardCharsets.UTF_8)
+                val paramBytes = cmd.appParams.toByteArray(StandardCharsets.UTF_8)
+                val buf = ByteBuffer.allocate(8 + idBytes.size + paramBytes.size).order(ByteOrder.LITTLE_ENDIAN)
+                buf.putInt(idBytes.size)
+                if (idBytes.isNotEmpty()) {
+                    buf.put(idBytes)
+                }
+                buf.putInt(paramBytes.size)
+                if (paramBytes.isNotEmpty()) {
+                    buf.put(paramBytes)
+                }
+                buf.array()
             }
             is WebLinkCommand.SetFps -> {
-                ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(cmd.fps).array()
+                ByteBuffer.allocate(1).put(cmd.fps.toByte()).array()
             }
             is WebLinkCommand.SyncSessionTime -> {
                 ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)
@@ -115,7 +126,14 @@ object WebLinkCodec {
                     WebLinkCommand.SyncSessionTime(clientTime, serverTime)
                 }
                 WebLinkCommand.ID_SET_FPS -> {
-                    WebLinkCommand.SetFps(buf.int)
+                    val fpsVal = if (buf.remaining() >= 4) {
+                        buf.int
+                    } else if (buf.remaining() >= 1) {
+                        buf.get().toInt() and 0xFF
+                    } else {
+                        30
+                    }
+                    WebLinkCommand.SetFps(fpsVal)
                 }
                 WebLinkCommand.ID_VIDEO_CONFIG -> {
                     val srcW = buf.int
@@ -171,7 +189,23 @@ object WebLinkCodec {
                     WebLinkCommand.DisplayMetrics(xdpi, ydpi, rawMetrics)
                 }
                 WebLinkCommand.ID_SET_CURRENT_APP -> {
-                    WebLinkCommand.SetCurrentApp(String(payload, StandardCharsets.UTF_8))
+                    if (buf.remaining() >= 4) {
+                        val idLen = buf.int
+                        val idStr = if (idLen > 0 && buf.remaining() >= idLen) {
+                            val b = ByteArray(idLen)
+                            buf.get(b)
+                            String(b, StandardCharsets.UTF_8)
+                        } else ""
+                        val paramLen = if (buf.remaining() >= 4) buf.int else 0
+                        val paramStr = if (paramLen > 0 && buf.remaining() >= paramLen) {
+                            val b = ByteArray(paramLen)
+                            buf.get(b)
+                            String(b, StandardCharsets.UTF_8)
+                        } else ""
+                        WebLinkCommand.SetCurrentApp(idStr, paramStr)
+                    } else {
+                        WebLinkCommand.SetCurrentApp(String(payload, StandardCharsets.UTF_8), "")
+                    }
                 }
                 WebLinkCommand.ID_BROWSER_COMMAND -> {
                     WebLinkCommand.BrowserAction(buf.int)
