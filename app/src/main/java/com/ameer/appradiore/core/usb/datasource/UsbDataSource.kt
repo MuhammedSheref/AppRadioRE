@@ -1,0 +1,118 @@
+package com.ameer.appradiore.core.usb.datasource
+
+import android.content.Context
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
+import android.os.ParcelFileDescriptor
+import com.ameer.appradiore.core.error.DataError
+import com.ameer.appradiore.core.error.EmptyResult
+import com.ameer.appradiore.core.error.Result
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.IOException
+
+interface UsbDataSource {
+    val incomingBytes: SharedFlow<ByteArray>
+    val isConnected: Boolean
+
+    fun open(accessory: UsbAccessory): EmptyResult<DataError.Usb>
+    fun close()
+    suspend fun write(data: ByteArray): EmptyResult<DataError.Usb>
+}
+
+class UsbDataSourceImpl(
+    private val context: Context,
+    private val scope: CoroutineScope
+) : UsbDataSource {
+
+    private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
+
+    private val _incomingBytes = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+    override val incomingBytes: SharedFlow<ByteArray> = _incomingBytes.asSharedFlow()
+
+    private var fileDescriptor: ParcelFileDescriptor? = null
+    private var inputStream: FileInputStream? = null
+    private var outputStream: FileOutputStream? = null
+    private var readJob: Job? = null
+
+    override val isConnected: Boolean
+        get() = fileDescriptor != null
+
+    override fun open(accessory: UsbAccessory): EmptyResult<DataError.Usb> {
+        close()
+        return try {
+            val pfd = usbManager.openAccessory(accessory)
+                ?: return Result.Error(DataError.Usb.DESCRIPTOR_OPEN_FAILED)
+
+            fileDescriptor = pfd
+            val fd = pfd.fileDescriptor
+            inputStream = FileInputStream(fd)
+            outputStream = FileOutputStream(fd)
+
+            startReadLoop()
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            close()
+            Result.Error(DataError.Usb.IO_ERROR)
+        }
+    }
+
+    private fun startReadLoop() {
+        readJob?.cancel()
+        readJob = scope.launch(Dispatchers.IO) {
+            val buffer = ByteArray(16384)
+            while (isActive) {
+                val input = inputStream ?: break
+                try {
+                    val bytesRead = input.read(buffer)
+                    if (bytesRead > 0) {
+                        val data = buffer.copyOf(bytesRead)
+                        _incomingBytes.emit(data)
+                    } else if (bytesRead < 0) {
+                        break
+                    }
+                } catch (e: IOException) {
+                    break
+                }
+            }
+            withContext(Dispatchers.Main) {
+                close()
+            }
+        }
+    }
+
+    override suspend fun write(data: ByteArray): EmptyResult<DataError.Usb> = withContext(Dispatchers.IO) {
+        val stream = outputStream ?: return@withContext Result.Error(DataError.Usb.STREAM_CLOSED)
+        try {
+            stream.write(data)
+            stream.flush()
+            Result.Success(Unit)
+        } catch (e: Exception) {
+            Result.Error(DataError.Usb.IO_ERROR)
+        }
+    }
+
+    override fun close() {
+        readJob?.cancel()
+        readJob = null
+
+        try {
+            inputStream?.close()
+            outputStream?.close()
+            fileDescriptor?.close()
+        } catch (_: Exception) {}
+
+        inputStream = null
+        outputStream = null
+        fileDescriptor = null
+    }
+}

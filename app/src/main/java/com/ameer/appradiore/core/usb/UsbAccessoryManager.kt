@@ -8,26 +8,20 @@ import android.content.IntentFilter
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.os.Build
-import android.os.ParcelFileDescriptor
 import androidx.core.content.ContextCompat
+import com.ameer.appradiore.core.error.onFailure
+import com.ameer.appradiore.core.error.onSuccess
+import com.ameer.appradiore.core.error.toUiText
 import com.ameer.appradiore.core.logging.LogDirection
 import com.ameer.appradiore.core.logging.LogRepository
 import com.ameer.appradiore.core.logging.ProtocolType
+import com.ameer.appradiore.core.usb.datasource.UsbDataSource
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.io.IOException
 
 interface UsbAccessoryManager {
     val connectionState: StateFlow<UsbConnectionState>
@@ -45,6 +39,7 @@ interface UsbAccessoryManager {
 
 class UsbAccessoryManagerImpl(
     private val context: Context,
+    private val usbDataSource: UsbDataSource,
     private val logRepository: LogRepository,
     private val coroutineScope: CoroutineScope
 ) : UsbAccessoryManager {
@@ -58,13 +53,8 @@ class UsbAccessoryManagerImpl(
     private val _connectionState = MutableStateFlow<UsbConnectionState>(UsbConnectionState.Disconnected)
     override val connectionState: StateFlow<UsbConnectionState> = _connectionState.asStateFlow()
 
-    private val _incomingBytes = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
-    override val incomingBytes: SharedFlow<ByteArray> = _incomingBytes.asSharedFlow()
+    override val incomingBytes: SharedFlow<ByteArray> = usbDataSource.incomingBytes
 
-    private var fileDescriptor: ParcelFileDescriptor? = null
-    private var inputStream: FileInputStream? = null
-    private var outputStream: FileOutputStream? = null
-    private var readJob: Job? = null
     private var isReceiverRegistered = false
 
     private val usbReceiver = object : BroadcastReceiver() {
@@ -207,111 +197,44 @@ class UsbAccessoryManagerImpl(
         disconnect()
         _connectionState.value = UsbConnectionState.Connecting(accessory)
 
-        try {
-            val pfd = usbManager.openAccessory(accessory)
-            if (pfd == null) {
-                _connectionState.value = UsbConnectionState.Error("Failed to open USB accessory descriptor")
+        usbDataSource.open(accessory)
+            .onSuccess {
+                _connectionState.value = UsbConnectionState.Connected(accessory)
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.USB,
-                    summary = "Failed to open USB accessory descriptor",
+                    summary = "Connected to ${accessory.manufacturer} ${accessory.model} (v${accessory.version})"
+                )
+            }
+            .onFailure { error ->
+                val errorMessage = error.toUiText().asString(context)
+                _connectionState.value = UsbConnectionState.Error(errorMessage)
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.USB,
+                    summary = "Connection failed: $errorMessage",
                     isError = true
                 )
-                return
             }
-
-            fileDescriptor = pfd
-            val fd = pfd.fileDescriptor
-            inputStream = FileInputStream(fd)
-            outputStream = FileOutputStream(fd)
-
-            _connectionState.value = UsbConnectionState.Connected(accessory)
-            logRepository.log(
-                direction = LogDirection.INTERNAL,
-                protocol = ProtocolType.USB,
-                summary = "Connected to ${accessory.manufacturer} ${accessory.model} (v${accessory.version})"
-            )
-
-            startReadLoop()
-        } catch (e: Exception) {
-            _connectionState.value = UsbConnectionState.Error("Connection error: ${e.message}")
-            logRepository.log(
-                direction = LogDirection.INTERNAL,
-                protocol = ProtocolType.USB,
-                summary = "Connection failed: ${e.message}",
-                isError = true
-            )
-        }
     }
 
-    private fun startReadLoop() {
-        readJob?.cancel()
-        readJob = coroutineScope.launch(Dispatchers.IO) {
-            val buffer = ByteArray(16384)
-            while (isActive) {
-                val input = inputStream ?: break
-                try {
-                    val bytesRead = input.read(buffer)
-                    if (bytesRead > 0) {
-                        val data = buffer.copyOf(bytesRead)
-                        _incomingBytes.emit(data)
-                    } else if (bytesRead < 0) {
-                        logRepository.log(
-                            direction = LogDirection.INTERNAL,
-                            protocol = ProtocolType.USB,
-                            summary = "USB stream reached EOF"
-                        )
-                        break
-                    }
-                } catch (e: IOException) {
-                    if (isActive) {
-                        logRepository.log(
-                            direction = LogDirection.INTERNAL,
-                            protocol = ProtocolType.USB,
-                            summary = "USB Read error: ${e.message}",
-                            isError = true
-                        )
-                    }
-                    break
-                }
+    override suspend fun send(data: ByteArray): Boolean {
+        var success = false
+        usbDataSource.write(data)
+            .onSuccess { success = true }
+            .onFailure { error ->
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.USB,
+                    summary = "Failed to write to USB: ${error.name}",
+                    isError = true
+                )
             }
-            withContext(Dispatchers.Main) {
-                disconnect()
-            }
-        }
-    }
-
-    override suspend fun send(data: ByteArray): Boolean = withContext(Dispatchers.IO) {
-        val stream = outputStream ?: return@withContext false
-        try {
-            stream.write(data)
-            stream.flush()
-            true
-        } catch (e: Exception) {
-            logRepository.log(
-                direction = LogDirection.INTERNAL,
-                protocol = ProtocolType.USB,
-                summary = "Failed to write to USB: ${e.message}",
-                isError = true
-            )
-            false
-        }
+        return success
     }
 
     override fun disconnect() {
-        readJob?.cancel()
-        readJob = null
-
-        try {
-            inputStream?.close()
-            outputStream?.close()
-            fileDescriptor?.close()
-        } catch (_: Exception) {}
-
-        inputStream = null
-        outputStream = null
-        fileDescriptor = null
-
+        usbDataSource.close()
         if (_connectionState.value !is UsbConnectionState.Disconnected) {
             _connectionState.value = UsbConnectionState.Disconnected
             logRepository.log(
