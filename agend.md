@@ -1,1198 +1,821 @@
 # Pioneer AppRadio Reverse Engineering — Complete Protocol & Architecture Agenda
 
-> **Purpose**: This document is the single source of truth for understanding how the original Pioneer AppRadio APK communicates with Pioneer car stereo head units. It will guide the development of our new app that uses Android Virtual Display to mirror content to the stereo.
+> **Purpose**: This document is the definitive technical specification and single source of truth for reverse engineering the Pioneer AppRadio (AAM2 / WebLink) system. It details the exact byte-level wire protocols, endianness rules, handshake state machines, authentication payloads, app registration/icon transfer protocols, video streaming mechanisms, and touch input relay. It serves as the direct implementation blueprint for building our new modern Android virtual-display mirroring application and live log diagnostic tool.
 
 ---
 
 ## Table of Contents
 
-1. [Project Overview & Goals](#1-project-overview--goals)
-2. [Original App Identity](#2-original-app-identity)
-3. [Architecture Overview](#3-architecture-overview)
-4. [Connection Modes: AAM1 vs AAM2](#4-connection-modes-aam1-vs-aam2)
-5. [AAM2 Protocol Deep Dive (Our Target)](#5-aam2-protocol-deep-dive-our-target)
-6. [WebLink Protocol Specification](#6-weblink-protocol-specification)
-7. [PProtocol Binary Framing (Pioneer Proprietary)](#7-pprotocol-binary-framing-pioneer-proprietary)
-8. [SAC Protocol — Command Opcodes & Message Types](#8-sac-protocol--command-opcodes--message-types)
-9. [Authentication & Handshake](#9-authentication--handshake)
-10. [Complete Connection Sequence (USB Plug → Session Active)](#10-complete-connection-sequence-usb-plug--session-active)
-11. [Heartbeat & Keepalive Mechanisms](#11-heartbeat--keepalive-mechanisms)
-12. [Screen Mirroring & H.264 Video Encoding](#12-screen-mirroring--h264-video-encoding)
-13. [Touch & Input Relay](#13-touch--input-relay)
-14. [Stereo/WebLink Commands Reference Table](#14-stereoweblink-commands-reference-table)
-15. [Remote Control & Media Commands](#15-remote-control--media-commands)
-16. [USB Accessory Configuration](#16-usb-accessory-configuration)
-17. [IPC Architecture (4 Processes)](#17-ipc-architecture-4-processes)
-18. [App Certification & Security](#18-app-certification--security)
-19. [Head Unit Model IDs & Display Specs](#19-head-unit-model-ids--display-specs)
-20. [Vehicle Safety Features](#20-vehicle-safety-features)
-21. [Modern Android Replacement Strategy](#21-modern-android-replacement-strategy)
-22. [New App Architecture Plan](#22-new-app-architecture-plan)
-23. [Phase 1: Live Log Skeleton App](#23-phase-1-live-log-skeleton-app)
+1. [Project Overview & Architectural Vision](#1-project-overview--architectural-vision)
+2. [Original App Identity & Decompiled Package Structure](#2-original-app-identity--decompiled-package-structure)
+3. [Multi-Process System Architecture](#3-multi-process-system-architecture)
+4. [Protocol Layering & Protocol Stack Architecture](#4-protocol-layering--protocol-stack-architecture)
+5. [Critical Endianness & Byte-Order Reference](#5-critical-endianness--byte-order-reference)
+6. [Transport Layer: MTP (Multiplexing Transport Protocol)](#6-transport-layer-mtp-multiplexing-transport-protocol)
+7. [WebLink Wire Protocol Specification](#7-weblink-wire-protocol-specification)
+8. [PProtocol Binary Framing Specification](#8-pprotocol-binary-framing-specification)
+9. [SAC Protocol Command Reference (Opcodes & Subtypes)](#9-sac-protocol-command-reference-opcodes--subtypes)
+10. [Exact Handshake Sequence & State Machine (RunableRetry)](#10-exact-handshake-sequence--state-machine-runableretry)
+11. [Authentication & Certification Details](#11-authentication--certification-details)
+12. [App Registration, App Info & Icon Transfer (Stereo Mirror Icon)](#12-app-registration-app-info--icon-transfer-stereo-mirror-icon)
+13. [App Launch & Remote Navigation Commands](#13-app-launch--remote-navigation-commands)
+14. [Video Output Handshake & Virtual Display Streaming Pipeline](#14-video-output-handshake--virtual-display-streaming-pipeline)
+15. [Touch Digitizer & Hardware Key Input Relay](#15-touch-digitizer--hardware-key-input-relay)
+16. [Audio Focus & AVRCP Remote Control Protocol](#16-audio-focus--avrcp-remote-control-protocol)
+17. [Keepalive, Heartbeat & Session Synchronization](#17-keepalive-heartbeat--session-synchronization)
+18. [Session Termination & Error Recovery Sequences](#18-session-termination--error-recovery-sequences)
+19. [USB Accessory Setup & Intent Filtering](#19-usb-accessory-setup--intent-filtering)
+20. [Head Unit Hardware Profiles & Model Identification](#20-head-unit-hardware-profiles--model-identification)
+21. [Modern Android Migration & Best Practice Replacements](#21-modern-android-migration--best-practice-replacements)
+22. [New App Clean Architecture Design](#22-new-app-clean-architecture-design)
+23. [Phase 1: Live Log Skeleton App Implementation Plan](#23-phase-1-live-log-skeleton-app-implementation-plan)
 
 ---
 
-## 1. Project Overview & Goals
+## 1. Project Overview & Architectural Vision
 
-We are building a **new Android app** that connects to a **Pioneer car stereo head unit** and mirrors our app's UI onto the stereo display, similar to how the original AppRadio works but using a **modern Android Virtual Display** approach.
+We are creating a modern replacement Android application for Pioneer AppRadio Mode 2 (AAM2) compatible car stereo head units.
 
-**Key goals:**
-- Replace the proprietary AppRadio app with our own implementation
-- Use the **AAM2 protocol** (USB AOA + WebLink) — this is our primary target
-- Use Android **Virtual Display** + **MediaProjection** for screen capture
-- Use **MediaCodec** for hardware H.264 encoding
-- Build with **modern Android best practices** (Jetpack Compose, Kotlin, Clean Architecture)
-- **Phase 1**: Build a live log app for protocol debugging and sharing
+### Primary Goals:
+1. **Ditch Legacy Proprietary Restrictions**: Replace the deprecated, permission-heavy Pioneer AppRadio Launcher with a lean, reliable Kotlin/Compose solution.
+2. **Virtual Display Mirroring**: Instead of relying on insecure internal view-hierarchy scraping or physical HDMI cables, our app creates an Android `VirtualDisplay` via `MediaProjection` and streams hardware-encoded H.264 video directly over the AAM2 USB connection.
+3. **True Two-Way Touch**: Translate touch digitizer coordinates received from the stereo touchscreen into native touch events dispatched to the virtual display.
+4. **Phase 1 Diagnostic Tool (Live Log App)**: Build a rock-solid skeleton app first that connects to the stereo over USB Open Accessory (AOA), executes the complete authentication and initialization handshake, logs every raw and parsed packet in real-time, and allows instant log sharing/export for protocol debugging.
 
 ---
 
-## 2. Original App Identity
+## 2. Original App Identity & Decompiled Package Structure
 
-| Property | Value |
-|---|---|
-| **Package Name** | `jp.pioneer.mbg.appradio.AppRadioLauncher` |
-| **Version** | 2.8.11 (versionCode 31) |
-| **Compile SDK** | 28 (Android 9) |
-| **Min SDK** | 19 (Android 4.4) |
-| **Target SDK** | 29 (Android 10) |
-| **Application Class** | `AAM2ServerApp` → extends `AppRadiaoLauncherApp` |
-| **Launcher Activity** | `GateWayConnect` |
+| Property | Value | Notes |
+|---|---|---|
+| **Package Name** | `jp.pioneer.mbg.appradio.AppRadioLauncher` | Target package name for whitelist spoofing if needed |
+| **Version** | 2.8.11 (versionCode 31) | Latest stable release |
+| **Compile / Target SDK** | Compile 28 (Pie), Target 29 (Q) | Requires modernisation for Android 14+ |
+| **Min SDK** | 19 (KitKat 4.4) | Legacy Android support |
+| **Application Class** | `AppRadiaoLauncherApp` (extends `AAM2ServerApp`) | Initializes WebLink server & AAM2 singletons |
+| **Launcher Activity** | `GateWayConnect` | State machine entry point |
+| **USB Accessory Filter** | Manufacturer: `Pioneer`, Model: `jp.pioneer.ce.aam2.linkwith`, Version: `1` | Specified in `accessory_filter.xml` |
 
 ---
 
-## 3. Architecture Overview
+## 3. Multi-Process System Architecture
+
+The original AppRadio application runs across **4 separate processes**:
 
 ```mermaid
 graph TB
-    subgraph Phone["Android Phone (4 Processes)"]
-        subgraph P1["Process: AppRadioLauncher"]
-            App["AppRadio Launcher App<br/>(GateWayConnect, MainActivity)"]
+    subgraph Phone["Android Phone (4 Separate Processes)"]
+        subgraph P1["Process 1: Main UI<br/>(jp.pioneer.mbg.appradio.AppRadioLauncher)"]
+            GateWay["GateWayConnect (Launcher)"]
+            MainActivity["MainActivity (App Grid)"]
         end
-        subgraph P2["Process: AppRadioService"]
-            Service["ExtScreenService<br/>(Bluetooth SPP)"]
+        subgraph P2["Process 2: AAM1 Service<br/>(jp.pioneer.mbg.appradio.AppRadioService)"]
+            ExtScreen1["ExtScreenService (SPP / HDMI)"]
+            PFormatEng["libPFormat.so (JNI)"]
         end
-        subgraph P3["Process: aam2.service"]
-            AAM2Svc["AAM2 ExtScreenService<br/>(USB/AOA Control)"]
+        subgraph P3["Process 3: AAM2 Service<br/>(jp.pioneer.ce.aam2.service)"]
+            AAM2Ext["AAM2 ExtScreenService"]
+            SPM["SmartPhoneProtocolMachine"]
             AOAComm["AOAUtilityCommunication"]
         end
-        subgraph P4["Process: aam2.pdservice"]
-            PD["ProtocolDispatcherService"]
-            USB["UsbAccessoryLayer"]
-            WL["WebLink Server"]
+        subgraph P4["Process 4: Protocol Dispatcher<br/>(com.abaltatech.aam2.pdservice)"]
+            PDService["ProtocolDispatcherService"]
+            UsbAcc["UsbAccessoryLayer (AOA)"]
+            MTPLayer["MTPLayer (Multiplexer)"]
+            WLServer["WLServer (WebLink)"]
         end
     end
 
-    subgraph HU["Pioneer Head Unit"]
-        HUDisplay["Head Unit Display"]
-        HUTouch["Touch Digitizer"]
-        HUKeys["Hardware Keys"]
+    subgraph HeadUnit["Pioneer Car Stereo"]
+        HU_USB["USB Host (AOA Driver)"]
+        HU_Disp["Head Unit Display"]
+        HU_Touch["Touch Digitizer"]
     end
 
-    App -->|"Binds AIDL"| AAM2Svc
-    AAM2Svc -->|"Binds Private AIDL"| PD
-    App -->|"Binds AIDL"| Service
-    PD -->|"Manages"| USB
-    PD -->|"Manages"| WL
-    USB <-->|"USB AOA"| HU
-    WL -->|"H.264 Frames"| HUDisplay
-    HUTouch -->|"Touch Events"| WL
-    HUKeys -->|"Key Events"| WL
+    GateWay -->|"Binds AIDL"| AAM2Ext
+    AAM2Ext -->|"Private AIDL"| PDService
+    PDService --> MTPLayer
+    MTPLayer --> UsbAcc
+    UsbAcc <-->|"USB AOA Bulk Endpoints"| HU_USB
+    WLServer -->|"H.264 Stream"| HU_Disp
+    HU_Touch -->|"Touch Packets"| SPM
 ```
 
-The system operates across **4 Android processes**, communicating via AIDL IPC, with the USB accessory layer and WebLink server running in the Protocol Dispatcher process.
+### In Our New App:
+We unify this fragmented 4-process architecture into a **single, clean Android process** featuring a foreground service managing the USB transport, protocol framing, virtual display, and video encoding pipelines.
 
 ---
 
-## 4. Connection Modes: AAM1 vs AAM2
+## 4. Protocol Layering & Protocol Stack Architecture
 
-| Feature | AAM1 (Legacy) | AAM2 (Our Target) |
-|---|---|---|
-| **Transport** | Bluetooth SPP (RFCOMM) | USB AOA (Android Open Accessory) |
-| **Video** | Physical HDMI cable | H.264 over USB (no HDMI needed) |
-| **SDK** | `PioneerKit` | `AAM2Kit` + Abaltatech WebLink |
-| **UUID/Filter** | `06d12392-19da-11e1-b377-000c29c2b35c` | Manufacturer: `Pioneer`, Model: `jp.pioneer.ce.aam2.linkwith` |
-| **Protocol** | PFormat (native JNI) | PProtocol (Java) + WebLink Commands |
-| **Keepalive** | 15s BT data timeout | WebLink `SyncSessionTime` (ID: 73) |
+The AAM2 protocol stack is a layered multiplexing architecture. The physical connection is raw USB Accessory bulk streams, which are subdivided into logical channels:
 
-> [!IMPORTANT]
-> **We are targeting AAM2 exclusively.** AAM1 details are provided for reference only.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             Application Layer                               │
+│           (Virtual Display Video Stream / Touch Event Dispatcher)           │
+├──────────────────────────────────────┬──────────────────────────────────────┤
+│          WebLink Protocol            │        Pioneer SAC Protocol          │
+│   (Video Frames, Audio, Heartbeat)   │   (Auth, SpecInfo, AppList, Icons)   │
+├──────────────────────────────────────┼──────────────────────────────────────┤
+│          WebLink Commands            │           PProtocol Frame            │
+│       ('WL' Header, Little-Endian)   │     (0x89..0x98 Header, Big-Endian)  │
+├──────────────────────────────────────┴──────────────────────────────────────┤
+│                   MTP (Multiplexing Transport Protocol)                     │
+│                  (Framed Packets: 0x1E ... 0x03, Big-Endian)                │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                      Abalta Userspace TCP/IP & Sockets                      │
+│                  (Internal Port 51729 / Local Socket Loops)                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                         USB Android Open Accessory                          │
+│               (UsbAccessory FileDescriptor, 16KB Read Buffer)               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 5. AAM2 Protocol Deep Dive (Our Target)
+## 5. Critical Endianness & Byte-Order Reference
 
-### 5.1 Layer Stack
+> [!CAUTION]
+> **Byte-order mismatches will instantly brick protocol communication.**
+> The AAM2 system mixes **Big-Endian (Network Byte Order)** and **Little-Endian (Intel Byte Order)** across different protocol layers.
 
-```mermaid
-graph TB
-    subgraph "Application Layer"
-        AAM2Kit["AAM2Kit API<br/>(pStartAAM2Kit, pSendTrackInfo)"]
-    end
-    subgraph "Service Layer"
-        ESM["ExtScreenServiceManager<br/>(AIDL Proxy)"]
-        EBS["ExtBaseService<br/>(IIRemoteServiceWrapper)"]
-    end
-    subgraph "Protocol Layer"
-        SPM["SmartPhoneProtocolMachine<br/>(Command Parser)"]
-        SAC["SACProtocolMachine<br/>(Opcodes & Data)"]
-        PP["PProtocol<br/>(Binary Framing)"]
-    end
-    subgraph "Communication Layer"
-        AOA["AOAUtilityCommunication<br/>(Control Messages)"]
-        WLPD["WLPDWrapper<br/>(WebLink Proxy)"]
-    end
-    subgraph "Transport Layer"
-        PD["ProtocolDispatcherImpl<br/>(USB Multiplexer)"]
-        UAL["UsbAccessoryLayer<br/>(Raw USB I/O)"]
-        MTP["MTPLayer<br/>(Multiplexing Transport)"]
-    end
-    subgraph "WebLink Layer"
-        WLS["WLServer<br/>(Display Sessions)"]
-        WLSC["WLServerConnection<br/>(Frame Encoding)"]
-        FE["FrameEncoderH264<br/>(MediaCodec)"]
-    end
-
-    AAM2Kit --> ESM
-    ESM -->|"AIDL IPC"| EBS
-    EBS --> SPM
-    SPM --> SAC
-    SAC --> PP
-    PP --> AOA
-    AOA -->|"Control Messages"| PD
-    WLPD -->|"WebLink Events"| PD
-    PD --> MTP
-    MTP --> UAL
-    WLS --> WLSC
-    WLSC --> FE
-```
-
-### 5.2 AAM2Kit SDK — Public API
-
-The `AAM2Kit` class provides static methods that map to AIDL IPC calls:
-
-```
-// Lifecycle
-AAM2Kit.pStartAAM2Kit(Context)      → Starts the AAM2 service
-AAM2Kit.pStopAAM2Kit(Context)       → Stops the AAM2 service
-
-// Protocol Dispatcher
-AAM2Kit.pConnectProtocolDispatcher() → Binds to ProtocolDispatcherService
-AAM2Kit.pDisconnectProtocolDispatcher()
-
-// USB Accessory
-AAM2Kit.pOnAccessoryAttached()       → Called when USB accessory detected
-
-// Listeners
-AAM2Kit.pRegisterLocationListener(IAAM2LocationListener)
-AAM2Kit.pRegisterRemoteCtrlListener(IAAM2RemoteCtrlListener)
-AAM2Kit.pRegisterMediaInfoReqListener(IAAM2MediaInfoReqListener)
-AAM2Kit.pRegisterAppFocusListener(IAAM2AppFocusListener)
-
-// Media Info
-AAM2Kit.pSendTrackInfo(int type, byte[] data)
-AAM2Kit.pSetMediaPlayerStatus(int status)
-```
-
-**Constants:**
-| Constant | Value | Description |
-|---|---|---|
-| `AAM2_LOCATION_INFO_ACCURACY_COARSE` | 100 | GPS coarse accuracy |
-| `AAM2_LOCATION_INFO_ACCURACY_FINE` | 10 | GPS fine accuracy |
-| `AAM2_REMOTE_CTRL_CMD_AV_TOGGLE` | 0 | Play/Pause toggle |
-| `AAM2_REMOTE_CTRL_CMD_AV_PLAY` | 1 | Play |
-| `AAM2_REMOTE_CTRL_CMD_AV_PAUSE` | 2 | Pause |
-| `AAM2_REMOTE_CTRL_CMD_AV_TRACKUP` | 3 | Next track |
-| `AAM2_REMOTE_CTRL_CMD_AV_TRACKDOWN` | 4 | Previous track |
-| `AAM2_REMOTE_CTRL_CMD_AV_FF` | 5 | Fast forward |
-| `AAM2_REMOTE_CTRL_CMD_AV_RW` | 6 | Rewind |
-| `AAM2_TRACKINFO_TYPE_TITLE` | 3 | Track title |
-| `AAM2_TRACKINFO_TYPE_ARTIST` | 4 | Track artist |
-| `AAM2_TRACKINFO_TYPE_ALBUM` | 5 | Track album |
-| `AAM2_TRACKINFO_TYPE_ELAPSED_TIME` | 6 | Elapsed time |
-
----
-
-## 6. WebLink Protocol Specification
-
-> [!IMPORTANT]
-> This is the **wire protocol** used between the WebLink Server (phone) and the Pioneer Head Unit for display streaming and input. This is the most critical section for our implementation.
-
-### 6.1 WebLink Command Format (8-byte header)
-
-Every WebLink message follows this structure:
-
-```
-Offset  Size    Field           Value/Description
-───────────────────────────────────────────────────
-0       1       Magic Byte 1    0x57 ('W')
-1       1       Magic Byte 2    0x4C ('L')
-2       2       Command ID      uint16 (see Command ID table)
-4       4       Payload Size    uint32 (size of payload only, not header)
-8       N       Payload         Variable (N = Payload Size)
-```
-
-**Total packet size** = 8 + Payload Size
-
-**Validation**: A valid command has bytes[0]==0x57, bytes[1]==0x4C, and `getInt(4) == totalSize - 8`.
-
-### 6.2 WebLink Command IDs
-
-| Command ID | Hex | Name | Direction | Description |
+| Protocol Layer | Magic Bytes | Endianness | Number Primitives | Buffer Handler |
 |---|---|---|---|---|
-| 1 | 0x01 | `FILL_RECTANGLE` | S→HU | Video frame (H.264 NAL units) |
-| 16 | 0x10 | `MOUSE_COMMAND` | HU→S | Legacy mouse events |
-| 17 | 0x11 | `KEYBOARD_COMMAND` | HU→S | Physical keyboard events |
-| 18 | 0x12 | `BROWSER_COMMAND` | HU→S | Back/forward navigation (keycode 4 = BACK) |
-| 19 | 0x13 | `SHOW_KEYBOARD` | S→HU | Request virtual keyboard display |
-| 20 | 0x14 | `HIDE_KEYBOARD` | S→HU | Hide virtual keyboard |
-| 21 | 0x15 | `WAIT_INDICATOR` | S→HU | Show loading indicator |
-| 32 | 0x20 | `VIDEO_CONFIG` | HU→S | Client requests video configuration |
-| 48 | 0x30 | `RECONNECT` | Both | Reconnection request |
-| 64 | 0x40 | `SETUP_SCROLL` | S→HU | Configure scroll areas |
-| 65 | 0x41 | `SCROLL_UPDATE` | HU→S | Scroll gesture data |
-| **66** | **0x42** | **`SET_CURRENT_APP`** | **S→HU** | **Identifies the active app (e.g., `wlhome_1.0://`)** |
-| 67 | 0x43 | `START_AUDIO` | S→HU | Begin audio streaming |
-| 68 | 0x44 | `STOP_AUDIO` | S→HU | Stop audio streaming |
-| 69 | 0x45 | `AUDIO_DATA` | S→HU | Audio sample data |
-| 70 | 0x46 | `PAUSE_AUDIO` | S→HU | Pause audio |
-| **71** | **0x47** | **`SET_FPS`** | **HU→S** | **Sets desired frame rate (clamped 1-30)** |
-| **72** | **0x48** | **`TOUCH_COMMAND`** | **HU→S** | **Multi-touch events from stereo** |
-| **73** | **0x49** | **`SYNC_SESSION_TIME`** | **Both** | **Heartbeat / session keepalive** |
-| 74 | 0x4A | `FRAME_DIAGNOSTIC` | S→HU | Frame diagnostics |
+| **MTP Layer** | Begin: `0x1E` (30)<br/>End: `0x03` (3) | **Big-Endian** | Word (16-bit): MSB first<br/>DWord (32-bit): MSB first | `ByteUtils.ReadWord`, `ByteUtils.ReadDWord` |
+| **WebLink Commands** | Magic: `0x57 0x4C` (`'W' 'L'`) | **Little-Endian** | Short (16-bit): LSB first<br/>Int (32-bit): LSB first<br/>Long (64-bit): LSB first<br/>Float: IEEE-754 Little-Endian | `DataBuffer.getShort`, `DataBuffer.getInt`, `DataBuffer.getLong`, `DataBuffer.getFloat` |
+| **PProtocol Framing** | Header: `0x89 0x89`<br/>Tail: `0x98 0x98` | **Big-Endian** | Int (32-bit): MSB first (Standard Java `DataOutputStream`) | `DataInputStream.readInt()`, `DataOutputStream.writeInt()` |
+| **SAC Command Payloads** | Opcode-dependent | **Big-Endian** | Short: MSB first<br/>Int: MSB first<br/>Long: MSB first | `DataInputStream.readShort()`, `DataOutputStream.writeShort()` |
 
-> **S→HU** = Server (Phone) to Head Unit, **HU→S** = Head Unit to Server (Phone)
-
-### 6.3 Video Frame Format (`FILL_RECTANGLE`, ID: 1)
-
-After the 8-byte WebLink header, the payload contains:
-
-```
-Offset  Size    Field           Description
-───────────────────────────────────────────────
-0       4       width           Frame width (int32)
-4       4       height          Frame height (int32)
-8       4       encoding type   0=None, 1=I420, 2=H.264, 4=XOR
-12      4       appID           Application identifier
-16      N       frame data      Encoded NAL units (H.264) or raw pixels
-```
-
-**Encoding Types:**
-| Value | Name | Description |
-|---|---|---|
-| 0 | `FRAME_ENCODING_NONE` | Raw uncompressed frame |
-| 1 | `FRAME_ENCODING_I420` | YUV I420 format |
-| **2** | **`FRAME_ENCODING_H264`** | **H.264 encoded (our target)** |
-| 4 | `FRAME_ENCODING_XOR` | XOR delta encoding |
-
-### 6.4 Touch Event Format (`TOUCH_COMMAND`, ID: 72)
-
-```
-Offset  Size    Field           Description
-───────────────────────────────────────────────
-0       4       EventType       0=Begin, 1=Update, 2=End
-4       4       Count           Number of touch points
-
-Per touch point (20 bytes each):
-───────────────────────────────────────────────
-+0      4       id              Pointer ID
-+4      4       posX            X coordinate (int32)
-+8      4       posY            Y coordinate (int32)
-+12     4       state           1=Pressed, 2=Moved, 4=Stationary, 8=Released
-+16     4       pressure        Float (touch pressure)
-```
-
-**Total touch payload size** = 8 + (Count × 20)
-
-### 6.5 Session Sync / Heartbeat (`SYNC_SESSION_TIME`, ID: 73)
-
-```
-Offset  Size    Field           Description
-───────────────────────────────────────────────
-0       8       ClientTime      Client uptime (long, ms)
-8       8       ServerTime      Server uptime (long, ms)
-```
-
-**Fixed payload size** = 16 bytes
-
-**Behavior**: When the server receives this from the head unit, it echoes back with the client's time preserved and `ServerTime` set to `SystemClock.uptimeMillis()`.
-
-### 6.6 Video Config Request (`VIDEO_CONFIG`, ID: 32)
-
-Sent by the head unit to negotiate display parameters:
-- Source width/height (what the phone captures)
-- Client width/height (what the head unit can display)
-- Encoding type preference
-
-### 6.7 Session Establishment Flow
-
-```mermaid
-sequenceDiagram
-    participant HU as Head Unit (WebLink Client)
-    participant WLS as WLServer (Phone)
-    participant WLSC as WLServerConnection
-
-    Note over HU,WLSC: WebLink Layer Handshake
-    WLS->>HU: UDP Broadcast on port 51729<br/>"ServerName,Port"
-    HU->>WLS: TCP Connect (or via USB tunnel)
-    WLS->>WLSC: Create WLServerConnection
-    WLSC->>HU: SetCurrentAppCommand (ID:66)<br/>app="wlhome_1.0://"
-    HU->>WLSC: VideoConfigCommand (ID:32)<br/>width, height, encoding=H264
-    WLSC->>WLSC: Create MediaCodec encoder<br/>Start VirtualDisplay capture
-    
-    loop Every frame
-        WLSC->>HU: FillRectangleCommand (ID:1)<br/>H.264 NAL units
-    end
-
-    loop Periodic
-        HU->>WLSC: SyncSessionTimeCommand (ID:73)<br/>ClientTime
-        WLSC->>HU: SyncSessionTimeCommand (ID:73)<br/>ClientTime, ServerTime
-    end
-
-    HU->>WLSC: TouchCommand (ID:72)<br/>Touch points
-    WLSC->>WLSC: Dispatch as MotionEvent
-```
+### Verification from Codebase:
+1. **WebLink (`DataBuffer.java`)**:
+   ```java
+   public int getInt(int i) {
+       int i2 = i + this.m_startPos;
+       return ((this.m_data[i2+3] & 255) << 24) |
+              ((this.m_data[i2]   & 255) << 0)  |
+              ((this.m_data[i2+1] & 255) << 8)  |
+              ((this.m_data[i2+2] & 255) << 16); // Little-Endian!
+   }
+   ```
+2. **MTP Layer (`ByteUtils.java`)**:
+   ```java
+   public static int getWord(byte[] bArr, int i) {
+       return getUnsignedSafe(bArr, i + 1) + ((getUnsignedSafe(bArr, i) << 8) & 65280); // Big-Endian!
+   }
+   ```
+3. **PProtocol (`PProtocol.java`)**:
+   ```java
+   // Uses standard java.io.DataOutputStream which writes integers in Big-Endian format
+   dataOutputStream.write(s_header); // 0x89, 0x89
+   dataOutputStream.writeInt(length); // Big-Endian 4-byte int
+   ```
 
 ---
 
-## 7. PProtocol Binary Framing (Pioneer Proprietary)
+## 6. Transport Layer: MTP (Multiplexing Transport Protocol)
 
-> [!IMPORTANT]
-> This is the **inner protocol** used for Pioneer-specific control messages (auth, touch relay, key events, GPS data) that travel over the WebLink control channel. It wraps SAC protocol commands.
+The MTP layer (`com.abaltatech.mcs.mtp`) multiplexes multiple logical data streams (TCP sockets, UDP datagrams, control channels) across a single stream transport (USB bulk or Bluetooth RFCOMM).
 
-### 7.1 PProtocol Packet Structure
+### 6.1 MTP Packet Layout
 
 ```
-Offset  Size    Field           Value/Description
-───────────────────────────────────────────────────
-0       1       Header Byte 1   0x89 (-119 signed)
-1       1       Header Byte 2   0x89 (-119 signed)
-2       4       Package Size    int32 (total size = HEADER_LENGTH + payload + TAIL_LENGTH)
-6       4       Count/Sequence  int32 (incrementing packet counter, s_count)
-10      4       SDK Version     int32 (Build.VERSION.SDK_INT)
-14      4       Type            int32 (0=SAC Payload, 1=MotionEvent, 2=KeyEvent)
-18      N       Payload Data    byte[] (SAC command data)
-18+N    1       Tail Byte 1     0x98 (-104 signed)
-19+N    1       Tail Byte 2     0x98 (-104 signed)
-20+N    4       CRC             int32 (simple sum of all bytes before CRC)
+Offset   Size     Field              Description
+─────────────────────────────────────────────────────────────────────────────
+0        1        MTP_BEGIN_FRAME    Fixed value: 0x1E (decimal 30, ASCII RS)
+1        2        Frame Size         Total packet size in bytes (Big-Endian uint16)
+3        2        Frame Options      Bit-packed options word (Big-Endian uint16)
+5        1..19    Source Address     Variable-length address structure
+5+N      1..19    Dest Address       Variable-length address structure
+5+N+M    K        Payload Data       Raw channel payload bytes
+End-3    2        Checksum (Opt)     Present only if checksum bit set (Big-Endian uint16)
+End-1    1        MTP_END_FRAME      Fixed value: 0x03 (decimal 3, ASCII ETX)
 ```
 
-**Key Constants:**
-| Constant | Value | Description |
-|---|---|---|
-| `HEADER_LENGTH` | 22 | Fixed header size (2+4+4+4+4+4 bytes before payload) |
-| `TAIL_LENGTH` | 2 | Tail marker size |
-| `CRC_LENGTH` | 4 | CRC checksum size |
-| `PKGDATA_SIZE` | 1024 | Fixed packet buffer size (all packets padded to 1024 bytes) |
-| `s_header` | `{0x89, 0x89}` | Magic header bytes |
-| `s_tail` | `{0x98, 0x98}` | Magic tail bytes |
+### 6.2 Frame Options Bit-Field Layout (16-bit word)
 
-### 7.2 PProtocol Type Field
+```
+Bit:  [15 .. 10]    [9]           [8]           [7 .. 4]       [3 .. 1]       [0]
+      Reserved   IsCompressed   HasChecksum   MessageType   SourceProtocol  IsLastMsg
+```
+- **Bit 0 (`IsLastMsg`)**: `1` if this is the last fragment of the message, `0` otherwise.
+- **Bits 1..3 (`SourceProtocol`)**:
+  - `0` = TCP stream (`MTP_PROTOCOL_TCP`)
+  - `1` = UDP datagram (`MTP_PROTOCOL_UDP`)
+- **Bits 4..7 (`MessageType`)**:
+  - `0` = `PT_Data`: Regular data packet
+  - `1` = `PT_ResolveAddr`: Address resolution request/response
+  - `2` = `PT_OpenListenConn`: Open server socket listener
+  - `3` = `PT_CloseListenConn`: Close server socket listener
+  - `4` = `PT_StartDGramListen`: Start UDP listener
+  - `5` = `PT_StopDGramListen`: Stop UDP listener
+- **Bit 8 (`HasChecksum`)**: `1` if 2-byte checksum is appended before `0x03`.
+- **Bit 9 (`IsCompressed`)**: `1` if payload is compressed.
 
-| Type Value | Constant | Description |
-|---|---|---|
-| 0 | `TYPE_INVALID` / SAC Payload | SAC protocol command (auth, spec, screen, etc.) |
-| 1 | `TYPE_MOTIONEVENT` | Serialized Android MotionEvent |
-| 2 | `TYPE_KEYEVENT` | Serialized Android KeyEvent |
+### 6.3 Address Encoding
+- `0x00`: Null / None address (Size: 1 byte)
+- `0x01`: IPv4 address (Size: 7 bytes: `1 byte schema + 4 bytes IP + 2 bytes port (Big-Endian)`)
+- `0x02`: IPv6 address (Size: 19 bytes: `1 byte schema + 16 bytes IP + 2 bytes port (Big-Endian)`)
 
-### 7.3 CRC Calculation
+---
 
-The CRC is a **simple arithmetic sum** of all bytes in the packet (from header through tail, excluding CRC itself):
+## 7. WebLink Wire Protocol Specification
 
+Used for display streaming, input events, and time synchronization.
+
+### 7.1 WebLink Command Header (8 bytes)
+
+```
+Offset   Size   Field          Description
+─────────────────────────────────────────────────────────────────────────────
+0        1      Magic Byte 1   0x57 (ASCII 'W')
+1        1      Magic Byte 2   0x4C (ASCII 'L')
+2        2      Command ID     uint16 (Little-Endian)
+4        4      Payload Size   uint32 (Little-Endian) — length of payload only
+8        N      Payload        Variable-length command-specific payload
+```
+
+### 7.2 Complete WebLink Command Table
+
+| Command ID | Hex | Name | Direction | Criticality | Description |
+|---|---|---|---|---|---|
+| **1** | 0x0001 | `FILL_RECTANGLE` | Phone → Stereo | **CRITICAL** | Video frame (H.264 NAL units) |
+| **16** | 0x0010 | `MOUSE_COMMAND` | Stereo → Phone | Legacy | Mouse position/click |
+| **17** | 0x0011 | `KEYBOARD_COMMAND` | Stereo → Phone | Normal | Hardware keyboard key event |
+| **18** | 0x0012 | `BROWSER_COMMAND` | Stereo → Phone | Important | Navigation (Action 0 = Back key) |
+| **19** | 0x0013 | `SHOW_KEYBOARD` | Phone → Stereo | Normal | Show virtual keyboard on stereo |
+| **20** | 0x0014 | `HIDE_KEYBOARD` | Phone → Stereo | Normal | Hide virtual keyboard |
+| **21** | 0x0015 | `WAIT_INDICATOR` | Phone → Stereo | Normal | Display busy spinner |
+| **32** | 0x0020 | `VIDEO_CONFIG` | Stereo → Phone | **CRITICAL** | Stereo sends supported resolutions/codecs |
+| **48** | 0x0030 | `RECONNECT` | Both | Recovery | Re-establish video/input session |
+| **64** | 0x0040 | `SETUP_SCROLL` | Phone → Stereo | Optional | Set scroll boundaries |
+| **65** | 0x0041 | `SCROLL_UPDATE` | Stereo → Phone | Optional | Scroll gesture updates |
+| **66** | 0x0042 | `SET_CURRENT_APP` | Phone → Stereo | **CRITICAL** | Active app URI (e.g. `wlhome_1.0://`) |
+| **67** | 0x0043 | `START_AUDIO` | Phone → Stereo | Audio | Initialize audio channel |
+| **68** | 0x0044 | `STOP_AUDIO` | Phone → Stereo | Audio | Teardown audio channel |
+| **69** | 0x0045 | `AUDIO_DATA` | Phone → Stereo | Audio | Raw audio PCM samples |
+| **70** | 0x0046 | `PAUSE_AUDIO` | Phone → Stereo | Audio | Pause audio channel |
+| **71** | 0x0047 | `SET_FPS` | Stereo → Phone | **CRITICAL** | Requested frame rate (1..30 fps) |
+| **72** | 0x0048 | `TOUCH_COMMAND` | Stereo → Phone | **CRITICAL** | Multi-touch digitizer coordinates |
+| **73** | 0x0049 | `SYNC_SESSION_TIME`| Both | **CRITICAL** | Heartbeat / ping-pong time sync |
+| **74** | 0x004A | `FRAME_DIAGNOSTIC` | Phone → Stereo | Debug | Frame transmission statistics |
+
+---
+
+## 8. PProtocol Binary Framing Specification
+
+PProtocol (`jp.pioneer.mbg.appradio.AAM2Service.protocol.PProtocol`) packages all Pioneer-specific control messages (authentication, product specs, touch relay, app catalog, icon transfers).
+
+### 8.1 PProtocol Frame Structure (Exact 1024-byte packet)
+
+```
+Offset   Size   Field            Value / Description
+─────────────────────────────────────────────────────────────────────────────
+0        2      Magic Header     0x89 0x89 (signed bytes: [-119, -119])
+2        4      Package Size     Big-Endian int32: (22 + payload.length + 2)
+6        4      Sequence Count   Big-Endian int32: auto-incrementing packet counter
+10       4      SDK Version      Big-Endian int32: Build.VERSION.SDK_INT
+14       4      Payload Type     Big-Endian int32:
+                                   0 = SAC Command Payload
+                                   1 = Serialized MotionEvent
+                                   2 = Serialized KeyEvent
+18       N      SAC Data         Payload bytes (SAC command structure)
+18+N     2      Magic Tail       0x98 0x98 (signed bytes: [-104, -104])
+20+N     4      CRC Checksum     Big-Endian int32: arithmetic sum of bytes 0..(20+N-1)
+24+N     ...    Zero Padding     Padded with zeroes up to exactly 1024 bytes
+```
+
+### 8.2 CRC Checksum Algorithm
 ```java
-int caculateCRC(byte[] data, int length) {
-    int crc = 0;
+int calculateCRC(byte[] buffer, int length) {
+    int sum = 0;
     for (int i = 0; i < length; i++) {
-        crc += data[i];  // signed byte arithmetic
+        sum += buffer[i]; // Standard signed 8-bit byte addition
     }
-    return crc;
+    return sum;
 }
 ```
 
-### 7.4 Packet Construction (pkgData)
+---
 
-```java
-// Write header: 0x89 0x89
-// Write packageSize: int32 (data.length + 22 + 2)
-// Write s_count: int32 (auto-incrementing)
-// Write SDK_INT: int32
-// Write type: int32 (0, 1, or 2)
-// Write data: byte[] (SAC payload)
-// Write tail: 0x98 0x98
-// Calculate CRC over everything written so far
-// Write CRC: int32
-// Pad entire buffer to exactly 1024 bytes
-```
+## 9. SAC Protocol Command Reference (Opcodes & Subtypes)
+
+The SAC (Smart-phone to Accessory Communication) protocol operates inside PProtocol frames where `Payload Type == 0`.
+
+### 9.1 S2A Commands (Smartphone → Head Unit)
+
+| Opcode | Hex | Constant | Subtype | Subtype Name | Payload Fields |
+|---|---|---|---|---|---|
+| **0** | 0x00 | `ID_S2A_AUTH` | 0 | `AUTH_BEGIN` | None (1 byte: `0x00`) |
+| | | | 1 | `AUTH_END` | `[info: byte, majorVer: short, minorVer: short]` |
+| | | | 16 | `ID_S2A_Start_App_Acc` | None (1 byte: `0x10`) |
+| | | | 17 | `ID_S2A_End_App_Acc` | None (1 byte: `0x11`) |
+| | | | 18 | `ID_S2A_Start_App_Info_Reply` | `[status: byte]` (1 = OK) |
+| | | | 19 | `ID_S2A_End_App_Info_Reply` | `[status: byte]` (1 = OK) |
+| | | | 20 | `ID_S2A_Start_Accessory_Info` | None (1 byte: `0x14`) |
+| | | | 21 | `ID_S2A_End_Accessory_Info` | None (1 byte: `0x15`) |
+| **2** | 0x02 | `ID_S2A_TERMINATION` | 0 | `TERMINATE` | `[type: byte]` |
+| **6** | 0x06 | `ID_S2A_PROC_SPEC` | 0 | `REQUEST_DISPLAY_INFO` | `[type: byte (0x00)]` |
+| | | | 1 | `REQUEST_SPEC_INFO` | `[type: byte (0x01)]` |
+| **16** | 0x10 | `ID_S2A_VEDIO_OUTPUT_REPLY`| 6 | `D0_VEDIO_OUTPUT` | `[type: byte (0x06), status: byte (0x01)]` |
+| **66** | 0x42 | `ID_S2A_KEY` | 0..3 | `KEY_EVENT` | `[type: byte, keycode: byte]` |
+| **80** | 0x50 | `ID_S2A_SMARTPHONE_AUDIOFOCUS_REPLAY` | 1 | `AUDIO_FOCUS_REPLY` | `[type: byte (0x01), result: byte (1=OK, 0=NG)]` |
+| **82** | 0x52 | `ID_S2A_SCREEN` | 0 | `BACK_HOME` | `[type: byte (0x00), keycode: byte]` |
+| | | | 255 | `ERROR_REPLY` | `[type: byte (0xFF), cmd: byte, param: byte]` |
+| **96** | 0x60 | `ID_S2A_ACCESSORY_STATUS` | 32 | `REQUEST_STATUS` | `[type: byte (0x20), 0xFF]` |
+| **112**| 0x70 | `ID_S2A_APPNINFO_RELY`| 1 | `APP_NAME_REPLY` | `[type: byte (0x01), appToken: short, len: short, utf8_name]` |
+| | | | 2 | `PACKAGE_NAME_REPLY` | `[type: byte (0x02), appToken: short, len: short, utf8_pkg]` |
+| **114**| 0x72 | `ID_S2A_TRACKNFO_RELY`| 1..6 | `TRACK_INFO_DATA` | Formatted track metadata |
+| **120**| 0x78 | `ID_S2A_APPIMAGE_TRANSFER_NOTIFICATION` | 0 | `ACQUISITION_REPLY` | `[type: 0x00, appToken: short, result: byte, totalSize: int32]` |
+| | | | 2 | `TRANSFER_CHUNK` | `[type: 0x02, appToken: short, index: short, len: short, chunk: 512B]` |
+| | | | 3 | `TRANSFER_END` | `[type: 0x03, appToken: short, endType: byte (0=OK, 1=Fail)]` |
+| | | | 4 | `TRANSFER_CANCEL_REPLY` | `[type: 0x04, appToken: short]` |
+
+### 9.2 A2S Commands (Head Unit → Smartphone)
+
+| Opcode | Hex | Constant | Subtype | Subtype Name | Description |
+|---|---|---|---|---|---|
+| **1** | 0x01 | `ID_A2S_AUTH` | 0 | `AUTH_RESPONSE` | `[0x00, result: byte, majorVer: short, minorVer: short]` |
+| | | | 16 | `ID_A2S_Start_App_Acc_Reply` | `[0x10, result: byte (0x01)]` |
+| | | | 17 | `ID_A2S_End_App_Acc_Reply` | `[0x11, result: byte (0x01)]` |
+| | | | 18 | `ID_A2S_Start_App_Info` | Stereo begins app list discovery |
+| | | | 19 | `ID_A2S_End_App_Info` | Stereo finishes app list discovery |
+| | | | 20 | `ID_A2S_Start_Accessory_Info_Reply` | `[0x14, result: byte (0x01)]` |
+| | | | 21 | `ID_A2S_End_Accessory_Info_Reply` | `[0x15, result: byte (0x01)]` |
+| **3** | 0x03 | `ID_A2S_TERMINATION` | 0 | `TERMINATE` | Head unit requests disconnect |
+| **7** | 0x07 | `ID_A2S_PROC_SPEC` | 0 | `DISPLAY_INFO` | `[0x00, pad: 4B, width: short, height: short, flags: int32]` |
+| | | | 1 | `SPEC_INFO` | `[0x01, devId: short, pointers: byte, gps: byte, avrcp: byte, can: byte, flags: byte]` |
+| **17** | 0x11 | `ID_A2S_VEDIO_OUTPUT`| 0 | `VIDEO_START` | Stereo requests phone to begin video stream |
+| **49** | 0x31 | `ID_A2S_LOCATIONMAILDATA` | - | `GPS_MAIL_DATA` | 84-byte NMEA / GPS blob from stereo |
+| **53** | 0x35 | `ID_A2S_GEOLOCATIONDATA` | 1 | `GPS_COORDINATES` | Latitude, Longitude, Altitude, Speed, Heading |
+| **65** | 0x41 | `ID_A2S_KEY` | 0 | `ACTION_KEY` | Home, Menu, Back key press |
+| | | | 2 | `INPUT_KEY` | Direct input key events |
+| **67** | 0x43 | `ID_A2S_TOUCH` | - | `TOUCH_EVENT` | Pioneer binary touch digitizer event |
+| **81** | 0x51 | `ID_A2S_REMOTECTRL` | 0 | `AV_CONTROL` | AVRCP Play, Pause, Track Up/Down, FF, RW |
+| | | | 1 | `AUDIO_FOCUS_REQ` | Stereo requests phone audio focus |
+| **83** | 0x53 | `ID_A2S_APPS` | 0 | `LAUNCH_HOME` | User pressed Home on stereo |
+| | | | 1 | `LAUNCH_PACKAGE` | User tapped app (by package name) |
+| | | | 2 | `LAUNCH_TOKEN` | User tapped app (by appToken) |
+| **97** | 0x61 | `ID_A2S_PACKAGEINFO` | 32 | `ACCESSORY_STATUS` | Parking brake status, HDMI state, VR state |
+| **113**| 0x71 | `ID_A2S_APPINFO_REQUEST`| 1 | `QUERY_APP_NAME` | Stereo asks for App Name of `appToken` |
+| | | | 2 | `QUERY_PACKAGE_NAME` | Stereo asks for Package Name of `appToken` |
+| **121**| 0x79 | `ID_A2S_APPIMAGE_TRANSFER_REQUEST` | 0 | `ACQUISITION_REQ` | Stereo queries icon dimensions & format |
+| | | | 1 | `START_TRANSFER` | Stereo ready to receive icon chunks |
+| | | | 2 | `CHUNK_ACK` | Stereo acknowledges chunk index |
+| | | | 3 | `TRANSFER_COMPLETE`| Stereo confirms full icon received |
+| | | | 4 | `CANCEL_TRANSFER` | Stereo cancels icon download |
 
 ---
 
-## 8. SAC Protocol — Command Opcodes & Message Types
+## 10. Exact Handshake Sequence & State Machine (RunableRetry)
 
-### 8.1 Smartphone → Accessory (S2A) Commands
+The entire initialization handshake is driven by a deterministic state machine managed by `RunableRetry.java`.
 
-| Opcode | Hex | Constant | Description |
-|---|---|---|---|
-| 0 | 0x00 | `ID_S2A_AUTH` | Send authentication (begin/end) |
-| 2 | 0x02 | `ID_S2A_TERMINATION` | Terminate session |
-| 6 | 0x06 | `ID_S2A_PROC_SPEC` | Send phone spec info |
-| 16 | 0x10 | `ID_S2A_Start_App_Acc` | Start app accessory mode |
-| 17 | 0x11 | `ID_S2A_End_App_Acc` | End app accessory mode |
-| 18 | 0x12 | `ID_S2A_Start_App_Info_Reply` | App info reply start |
-| 19 | 0x13 | `ID_S2A_End_App_Info_Reply` | App info reply end |
-| 20 | 0x14 | `ID_S2A_Start_Accessory_Info` | Start accessory info |
-| 21 | 0x15 | `ID_S2A_End_Accessory_Info` | End accessory info |
-| 33 | 0x21 | `ID_S2A_PACKAGE_MEDIA` | Media package info |
-| 66 | 0x42 | `ID_S2A_KEY` | Send key event |
-| 80 | 0x50 | `ID_S2A_SMARTPHONE_AUDIOFOCUS_REPLAY` | Audio focus reply |
-| 82 | 0x52 | `ID_S2A_SCREEN` | Screen command |
-| 84 | 0x54 | `ID_S2A_VOICE_CMD` | Voice command |
-| 85 | 0x55 | `ID_S2A_VOICE_CMD_REPLY` | Voice command reply |
-| 96 | 0x60 | `ID_S2A_ACCESSORY_STATUS` | Accessory status |
-| 99 | 0x63 | `ID_S2A_NOTIFICATION` / `GUIDESOUND` | Notification/guide sound |
-| 112 | 0x70 | `ID_S2A_APPNINFO_RELY` | App info reply |
-| 114 | 0x72 | `ID_S2A_TRACKNFO_RELY` | Track info reply |
-| 120 | 0x78 | `ID_S2A_APPIMAGE_TRANSFER_NOTIFICATION` | App image transfer start |
-
-### 8.2 Accessory → Smartphone (A2S) Commands
-
-| Opcode | Hex | Constant | Description |
-|---|---|---|---|
-| 1 | 0x01 | `ID_A2S_AUTH` | Auth response from head unit |
-| 3 | 0x03 | `ID_A2S_TERMINATION` | Terminate session |
-| 7 | 0x07 | `ID_A2S_PROC_SPEC` | Product spec info (display resolution, capabilities) |
-| 16 | 0x10 | `ID_A2S_Start_App_Acc_Reply` | Start app accessory mode reply |
-| 17 | 0x11 | `ID_A2S_VEDIO_OUTPUT` / `End_App_Acc_Reply` | Video output / End app reply |
-| 18 | 0x12 | `ID_A2S_Start_App_Info` | Start app info |
-| 19 | 0x13 | `ID_A2S_End_App_Info` | End app info |
-| 20 | 0x14 | `ID_A2S_Start_Accessory_Info_Reply` | Accessory info reply |
-| 21 | 0x15 | `ID_A2S_End_Accessory_Info_Reply` | End accessory info reply |
-| 49 | 0x31 | `ID_A2S_LOCATIONMAILDATA` | GPS/location data |
-| 51 | 0x33 | `ID_A2S_SENSOR` | Sensor data |
-| 53 | 0x35 | `ID_A2S_GEOLOCATIONDATA` | Geo-location data |
-| 65 | 0x41 | `ID_A2S_KEY` | Key event from head unit |
-| 67 | 0x43 | `ID_A2S_TOUCH` | Touch event from head unit |
-| 81 | 0x51 | `ID_A2S_REMOTECTRL` | AV remote control command |
-| 83 | 0x53 | `ID_A2S_APPS` | App list request |
-| 85 | 0x55 | `ID_A2S_VOICE_CMD_REPLY` | Voice recognition reply |
-| 97 | 0x61 | `ID_A2S_PACKAGEINFO` | Package info request |
-| 98 | 0x62 | `ID_A2S_NOTIFYREQUEST` | Notification request |
-| 113 | 0x71 | `ID_A2S_APPINFO_REQUEST` | App info request |
-| 115 | 0x73 | `ID_A2S_TRACKNFO_REQUEST` | Track info request |
-| 121 | 0x79 | `ID_A2S_APPIMAGE_TRANSFER_REQUEST` | App image transfer request |
-
-### 8.3 Auth Sub-Types
-
-| Constant | Value | Description |
-|---|---|---|
-| `AUTH_BEGIN` | 0 | Phone sends to initiate authentication |
-| `AUTH_END` | 1 | Authentication complete |
-| `AUTH_RESPONSE` | 0 | Head unit auth response type |
-| `AUTH_SUCCESS` | 1 | Authentication succeeded |
-| `AUTH_FAIL` | 0 | Authentication failed |
-
-### 8.4 Accessory Types
-
-| Constant | Value | Description |
-|---|---|---|
-| `ACCESSORY_TYPE_CRADLE` | 0 | Basic cradle |
-| `ACCESSORY_TYPE_SIMDRIVE` | 1 | Sim drive mode |
-| `ACCESSORY_TYPE_Open_UsingName` | 1 | Open using app name |
-| `ACCESSORY_TYPE_Open_UsingAppToken` | 2 | Open using app token |
-| `ACCESSORY_TYPE_LINKWITH_AAM2` | 8 | LinkWith AAM2 (our target) |
-| `ACCESSORY_TYPE_UNKNOWN` | 255 | Unknown type |
-
-### 8.5 Touch Constants
-
-| Constant | Value | Description |
-|---|---|---|
-| `ACCESSORY_TOUCH_INVALID` | 0 | No touch |
-| `ACCESSORY_TOUCH_DOWN` | 1 | Finger down |
-| `ACCESSORY_TOUCH_MOVE` | 2 | Finger move |
-| `ACCESSORY_TOUCH_RELEASE` | -1 | Finger lifted |
-
-### 8.6 Key Constants
-
-| Constant | Value | Description |
-|---|---|---|
-| `ACCESSORY_KEYCODE_INVALID` | 0 | No key |
-| `ACCESSORY_KEYCODE_HOME` | 1 | Home button |
-| `ACCESSORY_KEYCODE_MENU` | 1 | Menu button |
-| `ACCESSORY_KEYCODE_BACK` | 2 | Back button |
-| `ACCESSORY_KEYACTION_KEYDOWN` | 1 | Key pressed |
-| `ACCESSORY_KEYACTION_KEYHOLDING` | 2 | Key held |
-| `ACCESSORY_KEYACTION_KEYRELEASE` | -1 | Key released |
-
-### 8.7 Version Constants
-
-| Constant | Value |
-|---|---|
-| `APPRADIO_MAJOR_VERSION` | 3 |
-| `APPRADIO_MINOR_VERSION` | 1 |
-
----
-
-## 9. Authentication & Handshake
-
-### 9.1 Authentication Flow
+### 10.1 Complete State Machine Transitions
 
 ```mermaid
 sequenceDiagram
-    participant Phone as Phone (AAM2Service)
-    participant Auth as AccessoryAuthor
-    participant SPM as SmartPhoneProtocolMachine
-    participant HU as Head Unit
-
-    Note over Phone,HU: Connection established via USB AOA
-
-    Phone->>Auth: startAuth()
-    Auth->>Auth: Create HandlerThread "Spp Auth"
-    Auth->>SPM: sendAuthBegin()<br/>[ID_S2A_AUTH=0, type=AUTH_BEGIN=0]
-    Auth->>Auth: Wait 3000ms (AUTH_INTERVAL)
-
-    alt Auth Response Received
-        HU->>SPM: [ID_A2S_AUTH=1, type=AUTH_RESPONSE=0]
-        SPM->>SPM: Parse majorVer, minorVer
-        SPM->>Auth: onRemoteAuthBegin()
-        Auth->>SPM: sendAuthEnd()<br/>[ID_S2A_AUTH=0, type=AUTH_END=1]
-        Auth->>Auth: misAuthEnd = true
-        Auth->>Phone: localAccessoryChanelEstablished(true)
-    else No Response (Timeout)
-        Auth->>Auth: Retry (up to MAX_AUTH_COUNT=3)
-        alt All retries exhausted
-            Auth->>Phone: BluetoothCommunication.stop()
-            Auth->>Phone: Restart to READY/ACCEPT
-        end
-    end
-```
-
-### 9.2 Authentication Parameters
-
-| Parameter | Value |
-|---|---|
-| **Auth Interval** | 3000ms (wait time for response) |
-| **Max Retries** | 3 (`MAX_AUTH_COUNT`) |
-| **Auth States** | `AUTH_UNKNOWN=0`, `AUTH_ING=1`, `AUTH_END=2` |
-
-### 9.3 App Certification
-
-For 3rd party app verification, the system uses:
-
-```
-Hash = MD5(MD5(packageName + "PionnerKit"))
-```
-
-> [!NOTE]
-> The salt is `"PionnerKit"` — note the intentional(?) misspelling of "Pioneer".
-
-**Hardcoded certifications:**
-```
-AppRadio:  ExtCertifiedInfo("Pioneer", "jp.pioneer.mbg.appradio.AppRadioLauncher", "cc8116896fab216025f7dda114f9107f")
-DOP:       ExtCertifiedInfo("Pioneer", "jp.pioneer.mbgdop.appradio.AppRadioLauncher", "01fc011abd9e9b24176ff811cebac72c")
-```
-
----
-
-## 10. Complete Connection Sequence (USB Plug → Session Active)
-
-```mermaid
-sequenceDiagram
-    participant User as User
-    participant Android as Android OS
-    participant UA as UsbReceiver/<br/>AccessoryActivity
-    participant PD as ProtocolDispatcher<br/>Service
-    participant USB as UsbAccessoryLayer
-    participant MTP as MTPLayer
-    participant AAM2 as AAM2Service
-    participant AOA as AOAUtility<br/>Communication
-    participant SPM as SmartPhoneProtocol<br/>Machine
-    participant WL as WLServer
+    autonumber
+    participant Phone as Our Modern App
     participant HU as Pioneer Head Unit
 
-    User->>Android: Plug USB cable
-    Android->>UA: USB_ACCESSORY_ATTACHED intent<br/>Manufacturer=Pioneer<br/>Model=jp.pioneer.ce.aam2.linkwith<br/>Version=1
+    Note over Phone,HU: Phase 1: USB Open & Transport Setup
+    Phone->>HU: Open USB Accessory (jp.pioneer.ce.aam2.linkwith)
+    Phone->>HU: Initialize MTP Layer & Control Socket
 
-    Note over UA,PD: Step 1: USB Accessory Layer Init
-    UA->>PD: USB attached notification
-    PD->>USB: UsbManager.openAccessory()
-    USB->>USB: Get FileDescriptor
-    USB->>USB: Start "ADK reading thread"<br/>Buffer: 16384 bytes
-    USB->>USB: Open FileOutputStream for writes
+    Note over Phone,HU: Phase 2: Mutual Authentication
+    Phone->>HU: ID_S2A_AUTH (0), Subtype 0 (AUTH_BEGIN) [0x00]
+    HU->>Phone: ID_A2S_AUTH (1), Subtype 0 (AUTH_RESPONSE) [0x00, 0x01, Major: 3, Minor: 1]
+    Phone->>HU: ID_S2A_AUTH (0), Subtype 1 (AUTH_END) [0x01, Info: 1, Major: 3, Minor: 1]
 
-    Note over PD,MTP: Step 2: Transport Layer Setup
-    PD->>MTP: Initialize MTP multiplexer
-    MTP->>MTP: Wrap USB stream in<br/>SocketChannelTransportLayer
+    Note over Phone,HU: Phase 3: Kind 4 — Start App Accessory
+    Phone->>HU: ID_S2A_AUTH (0), Subtype 16 (ID_S2A_Start_App_Acc) [0x10]
+    HU->>Phone: ID_A2S_AUTH (1), Subtype 16 (ID_A2S_Start_App_Acc_Reply) [0x10, 0x01]
 
-    Note over PD,AAM2: Step 3: Control Channel Ready
-    PD->>AAM2: onControlChannelReady()<br/>via IPProtocolDispatcherPrivateNotification
-    AAM2->>AOA: Handle ready event
-    AOA->>AOA: STATE → STATE_CONNECTED (65283)
+    Note over Phone,HU: Phase 4: Kind 5 — Start Accessory Info
+    Phone->>HU: ID_S2A_AUTH (0), Subtype 20 (ID_S2A_Start_Accessory_Info) [0x14]
+    HU->>Phone: ID_A2S_AUTH (1), Subtype 20 (ID_A2S_Start_Accessory_Info_Reply) [0x14, 0x01]
 
-    Note over AAM2,HU: Step 4: Pioneer Auth Handshake
-    AAM2->>SPM: sendAuthBegin()
-    SPM->>HU: [PProtocol: 0x89 0x89 | ID_S2A_AUTH=0 | AUTH_BEGIN=0]
-    HU->>SPM: [PProtocol: 0x89 0x89 | ID_A2S_AUTH=1 | AUTH_RESPONSE=0]
-    SPM->>AAM2: onRemoteAuthBegin()
-    AAM2->>SPM: sendAuthEnd()
-    SPM->>HU: [PProtocol: 0x89 0x89 | ID_S2A_AUTH=0 | AUTH_END=1]
+    Note over Phone,HU: Phase 5: Query Head Unit Hardware Capabilities
+    Note right of Phone: Kind 2 (SpecInfo)
+    Phone->>HU: ID_S2A_PROC_SPEC (6), Subtype 1 [0x01]
+    HU->>Phone: ID_A2S_PROC_SPEC (7), Subtype 1 [0x01, ModelId, Pointers, GPS, AVRCP, CAN, Flags]
 
-    Note over AAM2,HU: Step 5: Spec Negotiation
-    HU->>SPM: [ID_A2S_PROC_SPEC=7]<br/>Display width, height, pointer count
-    SPM->>AAM2: onRemoteProductSpecInfo(DeviceSpecInfo)
+    Note right of Phone: Kind 1 (DisplayInfo)
+    Phone->>HU: ID_S2A_PROC_SPEC (6), Subtype 0 [0x00]
+    HU->>Phone: ID_A2S_PROC_SPEC (7), Subtype 0 [0x00, Pad: 4B, Width: 800, Height: 480, Flags]
 
-    Note over AAM2,HU: Step 6: App Session Start
-    HU->>SPM: [ID_A2S_Start_App_Acc_Reply=16]
-    SPM->>AAM2: Session established
+    Note right of Phone: Kind 3 (AccessoryStatus)
+    Phone->>HU: ID_S2A_ACCESSORY_STATUS (96), Subtype 32 [0x20, 0xFF]
+    HU->>Phone: ID_A2S_PACKAGEINFO (97), Subtype 32 [0x20, Flags: ParkingBrake|HDMI|VR]
 
-    Note over WL,HU: Step 7: WebLink Display Session
-    WL->>HU: SetCurrentAppCommand (ID:66)
-    HU->>WL: VideoConfigCommand (ID:32)<br/>Width, Height, Encoding=H264
-    WL->>WL: Create VirtualDisplay<br/>Init MediaCodec H.264 encoder
-    
-    loop Continuous
-        WL->>HU: FillRectangleCommand (ID:1)<br/>H.264 NAL units
-    end
+    Note right of Phone: Kind 6 (EndAccessoryInfo)
+    Phone->>HU: ID_S2A_AUTH (0), Subtype 21 (ID_S2A_End_Accessory_Info) [0x15]
+    HU->>Phone: ID_A2S_AUTH (1), Subtype 21 (ID_A2S_End_Accessory_Info_Reply) [0x15, 0x01]
+
+    Note over Phone,HU: Phase 6: Application Catalog & Icon Sync
+    HU->>Phone: ID_A2S_AUTH (1), Subtype 18 (ID_A2S_Start_App_Info)
+    Phone->>HU: ID_S2A_AUTH (0), Subtype 18 (ID_S2A_Start_App_Info_Reply) [0x12, 0x01]
+    HU->>Phone: ID_A2S_APPINFO_REQUEST (113), Subtype 1 (Query Name for Token 1)
+    Phone->>HU: ID_S2A_APPNINFO_RELY (112), Subtype 1 [Token: 1, Name: "MirrorApp\0"]
+    HU->>Phone: ID_A2S_APPINFO_REQUEST (113), Subtype 2 (Query Pkg for Token 1)
+    Phone->>HU: ID_S2A_APPNINFO_RELY (112), Subtype 2 [Token: 1, Pkg: "com.example.mirror\0"]
+    HU->>Phone: ID_A2S_APPIMAGE_TRANSFER_REQUEST (121) [Acquire Icon 128x128 PNG]
+    Phone->>HU: ID_S2A_APPIMAGE_TRANSFER_NOTIFICATION (120) [Icon Size: 8420 bytes]
+    HU->>Phone: ID_A2S_APPIMAGE_TRANSFER_REQUEST (121), Subtype 1 (Start Transfer)
+    Phone->>HU: Transmit 512-byte PNG chunks with index & ACK
+    HU->>Phone: ID_A2S_AUTH (1), Subtype 19 (ID_A2S_End_App_Info)
+    Phone->>HU: ID_S2A_AUTH (0), Subtype 19 (ID_S2A_End_App_Info_Reply) [0x13, 0x01]
+
+    Note over Phone,HU: Phase 7: Video Stream Activation
+    HU->>Phone: ID_A2S_VEDIO_OUTPUT (17) [0x11]
+    Phone->>HU: ID_S2A_VEDIO_OUTPUT_REPLY (16) [0x06, 0x01]
+    Phone->>HU: WebLink SetCurrentAppCommand (ID: 66) ["wlhome_1.0://"]
+    HU->>Phone: WebLink VideoConfigCommand (ID: 32)
+    Phone->>HU: WebLink FillRectangleCommand (ID: 1) [H.264 Video Stream Active]
 ```
+
+### 10.2 Handshake Timer & Retry Specifications
+
+From `RunableRetry.java`:
+
+| Kind ID | State Name | Command Sent | Max Retries | Interval (ms) | Trigger to Next State |
+|---|---|---|---|---|---|
+| **4** | `INIT_START_APP_ACC` | `ID_S2A_Start_App_Acc` | **2** | **500 ms** | Receives `ID_A2S_Start_App_Acc_Reply` → triggers Kind 5 |
+| **5** | `INIT_START_ACCESSORY` | `ID_S2A_Start_Accessory_Info` | **3** | **3000 ms** | Receives `ID_A2S_Start_Accessory_Info_Reply` → queues 2, 1, 3, 6 |
+| **2** | `REQUEST_SPECINFO` | `ID_S2A_PROC_SPEC` (type 1) | **3** | **3000 ms** | Receives `ID_A2S_PROC_SPEC` (type 1) → triggers Kind 1 |
+| **1** | `REQUEST_DISPLAY` | `ID_S2A_PROC_SPEC` (type 0) | **3** | **3000 ms** | Receives `ID_A2S_PROC_SPEC` (type 0) → triggers Kind 3 |
+| **3** | `REQUEST_STATUS` | `ID_S2A_ACCESSORY_STATUS` | **3** | **3000 ms** | Receives `ID_A2S_PACKAGEINFO` → triggers Kind 6 |
+| **6** | `INIT_END_ACCESSORY` | `ID_S2A_End_Accessory_Info` | **3** | **3000 ms** | Receives `ID_A2S_End_Accessory_Info_Reply` → Phase 5 complete |
+| **8** | `APP_IMAGE_START` | `sendAppImageDataAcquisitionStartReply` | **1** | **5000 ms** | Receives `ID_A2S_APPIMAGE_TRANSFER_REQUEST` (sub 1) → triggers 9 |
+| **9** | `APP_IMAGE_CHUNK` | `sendAppImageDataTransfer` (512B) | **3** | **3000 ms** | Receives `ID_A2S_APPIMAGE_TRANSFER_REQUEST` (sub 2) ack → next chunk |
+| **10**| `APP_IMAGE_END` | `sendAppImageDataTransferEnd` | **3** | **3000 ms** | Receives `ID_A2S_APPIMAGE_TRANSFER_REQUEST` (sub 3) |
 
 ---
 
-## 11. Heartbeat & Keepalive Mechanisms
+## 11. Authentication & Certification Details
 
-### 11.1 WebLink Level — SyncSessionTime
-
-The primary keepalive for AAM2 connections:
-
-- **Command**: `SYNC_SESSION_TIME` (ID: 73)
-- **Initiated by**: Head Unit (client)
-- **Server response**: Echo back with `ClientTime` preserved, `ServerTime = SystemClock.uptimeMillis()`
-- **Payload**: 16 bytes (two int64 timestamps)
-
-```java
-// Server handling:
-void handleSyncSessionTime(SyncSessionTimeCommand cmd) {
-    connection.sendCommand(new SyncSessionTimeCommand(
-        cmd.getCurrentClientTime(),     // Echo client time back
-        SystemClock.uptimeMillis()       // Add server time
-    ));
-}
-```
-
-### 11.2 Bluetooth Level — Data Timeout (AAM1 only)
-
-For Bluetooth SPP connections:
-- **Timeout**: 15000ms (`mBTDataTimeOut`)
-- **Mechanism**: Handler posts a delayed runnable. Each data read resets the timer.
-- **On timeout**: Drops BT connection and restarts to ready/accept state.
-
-### 11.3 Socket Level Keepalive
-
-The MCS SocketTransportLayer enables TCP keepalive on its sockets:
-```java
-this.m_clientSocket.setKeepAlive(true);
-```
-
----
-
-## 12. Screen Mirroring & H.264 Video Encoding
-
-### 12.1 H.264 Encoder Configuration
-
-From [`FrameEncoderH264`](file:///D:/AppDevelopment/AppRadioRE/decompiledApkFiles/sources/com/abaltatech/weblinkserver/FrameEncoderH264.java):
-
-| Parameter | Value | Description |
-|---|---|---|
-| **MIME Type** | `video/avc` | H.264 AVC |
-| **Default Bitrate** | 3,500,000 (3.5 Mbps) | `DEF_BIT_RATE` |
-| **Default Frame Rate** | 2 FPS | `DEF_FRAME_RATE` |
-| **I-Frame Interval** | 1 second | `i-frame-interval` |
-| **Profile** | Baseline (1) | `AVCProfileBaseline` |
-| **Level** | 3.1 (512) | `AVCLevel31` |
-| **Color Format** | `COLOR_FormatSurface` (2130708361) | Surface input mode |
-| **Max Resolution** | 1280×1280 | Capped per axis |
-| **Dequeue Timeout** | 500ms | `kTimeOutUs = 500000` |
-| **Max Failed Attempts** | 2 | Before encoder restart |
-
-### 12.2 Encoder Modes
-
-1. **Surface Input Mode** (SDK ≥ 18 / Android 4.3+):
-   - Uses `encoder.createInputSurface()`
-   - EGL context renders `SurfaceTexture` frames via OpenGL ES 2.0 shaders
-   - Uses `GL_OES_EGL_image_external` extension
-
-2. **Buffer Input Mode** (fallback):
-   - Dequeue input buffers directly
-   - Convert pixel format via JNI `convertColorFormat()`
-   - Uses `DeviceH264EncoderSettings.COLOR_FORMAT`
-
-### 12.3 Screen Capture Pipeline
-
-```mermaid
-graph LR
-    VD["VirtualDisplay<br/>(or WLMirrorLayer)"] --> ST["SurfaceTexture"]
-    ST --> EGL["EGL/OpenGL ES 2.0<br/>Shader Pipeline"]
-    EGL --> MC["MediaCodec<br/>Input Surface"]
-    MC --> NAL["H.264 NAL Units"]
-    NAL --> FRC["FillRectangleCommand<br/>(WebLink ID:1)"]
-    FRC --> USB["USB AOA to HU"]
-```
-
-### 12.4 FPS Control
-
-The head unit can control frame rate via `SET_FPS` command (ID: 71):
-- FPS is clamped between 1 and 30
-- Capture interval = `1000 / fps` (milliseconds between frames)
-
----
-
-## 13. Touch & Input Relay
-
-### 13.1 WebLink Touch Flow
-
-```mermaid
-graph LR
-    HU["Head Unit<br/>Touch Screen"] -->|"TouchCommand<br/>(ID:72)"| WL["WLServerConnection"]
-    WL -->|"Scale coords<br/>to phone resolution"| ML["WLMirrorLayer"]
-    ML -->|"dispatchTouchEvent()"| View["Android View<br/>Hierarchy"]
-```
-
-### 13.2 Touch Point Structure (per point)
-
-```
-struct TouchPoint {
-    int32 id;        // Pointer ID (0, 1, 2, ...)
-    int32 posX;      // X coordinate on HU display
-    int32 posY;      // Y coordinate on HU display
-    int32 state;     // 1=Pressed, 2=Moved, 4=Stationary, 8=Released
-    float pressure;  // Touch pressure (0.0 - 1.0)
-};
-```
-
-### 13.3 PProtocol Touch Events (Pioneer Layer)
-
-When using the Pioneer protocol layer (SAC command `ID_A2S_TOUCH = 67`):
-- Touch data includes pointer count, action type, X/Y coordinates
-- Mapped to physical screen dimensions from `ProductSpecInfo`
-- Dispatched via `LocalPEventInputManager` using reflection:
-  - SDK < 16: `IWindowManager.injectPointerEvent()`
-  - SDK >= 16: `IInputManager.injectInputEvent()`
-
-### 13.4 Key Events
-
-**BrowserCommand (WebLink ID: 18)**:
-- Action 0 → dispatches KEYCODE_BACK (keycode 4) via `view.dispatchKeyEvent()`
-
-**SAC Key Events (`ID_A2S_KEY = 65`)**:
-- Key types: `ACTIONKEY=0`, `INPUTKEY=2`, `CMKKEY=3`
-- Key options: `ACTION=0` (short press), `LONGACTION=1` (long press)
-
----
-
-## 14. Stereo/WebLink Commands Reference Table
-
-### 14.1 Complete WebLink Command Quick Reference
-
-| ID | Name | Dir | Payload | Critical? |
-|---|---|---|---|---|
-| 1 | FILL_RECTANGLE | S→HU | 16B header + H.264 data | ✅ Video frames |
-| 32 | VIDEO_CONFIG | HU→S | Resolution, encoding | ✅ Session setup |
-| 66 | SET_CURRENT_APP | S→HU | App URL string | ✅ App identity |
-| 71 | SET_FPS | HU→S | FPS value (1-30) | ✅ Frame rate |
-| 72 | TOUCH_COMMAND | HU→S | Event + touch points | ✅ User input |
-| 73 | SYNC_SESSION_TIME | Both | 2× int64 timestamps | ✅ Heartbeat |
-| 18 | BROWSER_COMMAND | HU→S | Action (back/forward) | ⚠️ Navigation |
-| 48 | RECONNECT | Both | - | ⚠️ Recovery |
-| 67-70 | AUDIO_* | S→HU | Audio samples | 📌 Optional |
-| 19-20 | KEYBOARD_* | S→HU | - | 📌 Optional |
-| 64-65 | SCROLL_* | Both | Scroll data | 📌 Optional |
-| 74 | FRAME_DIAGNOSTIC | S→HU | Diagnostic data | 📌 Debug |
-
----
-
-## 15. Remote Control & Media Commands
-
-### 15.1 AV Remote Control Commands (SAC ID: `ID_A2S_REMOTECTRL = 81`)
-
-| Command | Value | Description |
-|---|---|---|
-| TOGGLE | 0 | Play/Pause toggle |
-| PLAY | 1 | Play |
-| PAUSE | 2 | Pause |
-| TRACKUP | 3 | Next track |
-| TRACKDOWN | 4 | Previous track |
-| FF | 5 | Fast forward |
-| RW | 6 | Rewind |
-| RATINGUP | 33 | Rating up |
-| RATINGDOWN | 34 | Rating down |
-
-### 15.2 Track Info Types
-
-| Type | Value | Description |
-|---|---|---|
-| SETTING | 1 | Track settings |
-| INFO | 2 | Track info update |
-| TITLE | 3 | Track title |
-| ARTIST | 4 | Artist name |
-| ALBUM | 5 | Album name |
-| ELAPSED_TIME | 6 | Elapsed playback time |
-
-### 15.3 Smartphone Source Types
-
-| Source | Value | Description |
-|---|---|---|
-| INVALID | 0 | No source |
-| TUNER | 1 | Radio tuner |
-| REARCAMERA | 2 | Rear camera |
-| PHONE | 3 | Phone call |
-| SETTING | 4 | Settings |
-| IPOD | 5 | iPod/Music |
-
----
-
-## 16. USB Accessory Configuration
-
-### 16.1 Accessory Filter (`accessory_filter.xml`)
-
-```xml
-<usb-accessory
-    manufacturer="Pioneer"
-    model="jp.pioneer.ce.aam2.linkwith"
-    version="1" />
-```
-
-### 16.2 USB Layer Details
-
-| Parameter | Value |
-|---|---|
-| **Read Buffer** | 16384 bytes |
-| **Thread Name** | "ADK reading thread" |
-| **Write** | `FileOutputStream` on USB FileDescriptor |
-| **Read** | `FileInputStream` on USB FileDescriptor |
-| **Broadcast Port** | 51729 (WebLink UDP discovery) |
-
-### 16.3 Handler Message IDs
-
-| Constant | Value | Description |
-|---|---|---|
-| `AOA_C_MSG` | 65520 | AOA connection state update |
-
----
-
-## 17. IPC Architecture (4 Processes)
-
-### 17.1 Process Map
-
-| # | Process Name | Purpose | Key Service |
-|---|---|---|---|
-| 1 | `jp.pioneer.mbg.appradio.AppRadioLauncher` | Main UI | Activities |
-| 2 | `jp.pioneer.mbg.appradio.AppRadioService` | AAM1 Background | `ExtScreenService` |
-| 3 | `jp.pioneer.ce.aam2.service` | AAM2 Background | AAM2 `ExtScreenService` |
-| 4 | `com.abaltatech.aam2.pdservice` | Protocol Dispatcher | `ProtocolDispatcherService` |
-
-### 17.2 AIDL Interfaces
-
-| Interface | Binding Action | Purpose |
-|---|---|---|
-| `ISppControl` | `com.extscreen.service` | AAM1 service control |
-| `ISppControl` | `jp.pioneer.ce.aam2service` | AAM2 service control |
-| `IPProtocolDispatcher` | `abaltatech.intent.action.bindProtocolDispatcherService` | WebLink public API |
-| `IPProtocolDispatcherPrivate` | `abaltatech.intent.action.bindProtocolDispatcherPrivateService` | Control channel |
-
-### 17.3 Key Permissions
-
-```xml
-<!-- Custom Pioneer permissions (signature-level) -->
-<permission android:name="pioneer.permission.appradio.AV_APP_CTRL_MODE" />
-<permission android:name="pioneer.permission.appradio.ADVANCED_APPMODE" />
-<permission android:name="pioneer.permission.appradio.AAM2" />
-
-<!-- Critical system permissions -->
-<uses-permission android:name="android.permission.INJECT_EVENTS" />
-<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-<uses-permission android:name="android.permission.GET_TASKS" />
-<uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" />
-```
-
----
-
-## 18. App Certification & Security
-
-### 18.1 HDMI Certified Package
-
-The `HDMICertifiedPackage` encodes foreground app status in a single byte:
-
-```
-Bit Layout:
-[7] [6]              [5]                   [4:2] [1]              [0]
-     geoLocationReq   soundInterruptionReq        foregroundInfo    locationRequest
-```
-
-### 18.2 App Image Types
-
-| Type | Value |
-|---|---|
-| BMP | 2 |
-| JPG | 3 |
-| PNG | 18 |
-| APPICON (kind) | 16 |
-
----
-
-## 19. Head Unit Model IDs & Display Specs
-
-### 19.1 Model Categories
-
-| Category | Model IDs |
-|---|---|
-| **Japan Domestic** | 2, 3, 7, 8, 769, 770, 8194, 8195, 8961-8966, 4107, 4111 |
-| **Overseas** | 1, 4-6, 9-12, 4097-4114, 8193, 8196, 8199-8204 |
-| **Default AppRadio** | 8194 (0x2002) |
-| **Default DOP** | 8961 (0x2301) |
-
-### 19.2 Display Spec Info (from `ProductSpecInfo`)
-
-The head unit reports:
-- `remotePhysicalWidth` — Physical display width in pixels
-- `remotePhysicalHeight` — Physical display height in pixels
-- Pointer count (touch support level 1, 2, or 3)
-- Location device type (GPS capability)
-
----
-
-## 20. Vehicle Safety Features
-
-### 20.1 Parking Brake Detection
-
-- Head unit reports parking brake state via `onRemoteParkingInfo()` / `onRemoteBooleanParkingInfo()`
-- `ACCESSORY_PARK = 32` — Parking notification type
-- When brake is off (driving): certain features are locked
-
-### 20.2 Screen Transitions
-
-| Screen | Value | Description |
-|---|---|---|
-| HOME | 0 | Go to home screen |
-| PANDORA | 1 | Pandora music screen |
-| TRANSITION | 0 | Generic screen transition |
-
----
-
-## 21. Modern Android Replacement Strategy
-
-> [!WARNING]
-> The original app uses many deprecated/restricted APIs. Our new app needs modern replacements.
-
-### 21.1 API Replacements
-
-| Original Approach | Issue | Our Replacement |
-|---|---|---|
-| `getRunningTasks()` | Deprecated/restricted | Not needed (we ARE the app) |
-| `INJECT_EVENTS` | System-only permission | `VirtualDisplay` + `Instrumentation` or Accessibility |
-| `SYSTEM_ALERT_WINDOW` | Heavily restricted | Not needed with VirtualDisplay approach |
-| HDMI output | Removed from most phones | `MediaProjection` + `VirtualDisplay` |
-| `BluetoothCommunication` (SPP) | AAM1 only | Not needed (using USB AOA) |
-| WebLink `WLMirrorLayer` reflection | Fragile, breaks on updates | `MediaProjection` API |
-| Facebook/Twitter SDKs | Deprecated | Remove entirely |
-| PFormat JNI (libPFormat.so) | AAM1 only | PProtocol Java (already available for AAM2) |
-
-### 21.2 Modern Architecture Stack
-
-| Layer | Technology |
-|---|---|
-| **UI** | Jetpack Compose |
-| **Architecture** | MVI (State, Action, Event) |
-| **DI** | Koin |
-| **Navigation** | Compose Navigation (type-safe) |
-| **USB Communication** | `UsbManager` + USB Accessory API |
-| **Screen Capture** | `MediaProjection` + `VirtualDisplay` |
-| **Video Encoding** | `MediaCodec` (hardware H.264) |
-| **Protocol** | Custom Kotlin implementation of PProtocol + WebLink |
-| **Logging** | Timber + custom log capture |
-| **Async** | Kotlin Coroutines + Flow |
-
----
-
-## 22. New App Architecture Plan
-
-```mermaid
-graph TB
-    subgraph UI["UI Layer (Compose)"]
-        LogScreen["Log Screen<br/>(Real-time protocol logs)"]
-        ConnScreen["Connection Screen<br/>(USB status, stereo info)"]
-        SettingsScreen["Settings Screen"]
-    end
-
-    subgraph Domain["Domain Layer"]
-        ConnUseCase["ConnectToStereoUseCase"]
-        SendFrameUseCase["SendVideoFrameUseCase"]
-        HandleTouchUseCase["HandleTouchInputUseCase"]
-    end
-
-    subgraph Data["Data Layer"]
-        USBRepo["UsbAccessoryRepository"]
-        ProtocolRepo["ProtocolRepository"]
-        LogRepo["LogRepository"]
-    end
-
-    subgraph Protocol["Protocol Layer"]
-        PProto["PProtocolCodec<br/>(Encode/Decode 0x89..0x98)"]
-        WLCodec["WebLinkCodec<br/>(Encode/Decode 'WL' commands)"]
-        SACHandler["SACCommandHandler<br/>(Auth, Touch, Key, Spec)"]
-    end
-
-    subgraph Transport["Transport Layer"]
-        USBAcc["UsbAccessoryManager<br/>(AOA open/read/write)"]
-    end
-
-    subgraph Capture["Capture Layer"]
-        VP["VirtualPresentation<br/>(Android VirtualDisplay)"]
-        Encoder["H264Encoder<br/>(MediaCodec wrapper)"]
-    end
-
-    UI --> Domain
-    Domain --> Data
-    Data --> Protocol
-    Protocol --> Transport
-    VP --> Encoder
-    Encoder --> WLCodec
-```
-
----
-
-## 23. Phase 1: Live Log Skeleton App
-
-### 23.1 Purpose
-
-Before implementing the full mirroring, we build a **live logging app** that:
-1. Connects to the Pioneer stereo via USB AOA
-2. Performs the PProtocol handshake
-3. Logs every protocol message in real-time
-4. Makes logs shareable for debugging
-5. Provides a foundation for the full app
-
-### 23.2 Feature List
-
-- [ ] USB Accessory detection and connection
-- [ ] PProtocol frame encoding/decoding
-- [ ] SAC command parsing
-- [ ] WebLink command parsing
-- [ ] Real-time log display (Compose LazyColumn)
-- [ ] Log filtering by command type
-- [ ] Log export (share as file)
-- [ ] Connection state display
-- [ ] Head Unit spec info display (when received)
-- [ ] Auth handshake execution and logging
-
-### 23.3 Module Structure
-
-```
-:app                     — Main application entry point, DI wiring
-:core:protocol           — PProtocol, WebLink, SAC codec implementations
-:core:usb                — USB Accessory layer
-:core:logging            — Log capture and storage
-:feature:livelog          — Live log screen UI + ViewModel
-:feature:connection       — Connection management UI + ViewModel
-```
-
-### 23.4 Key Classes to Implement
-
+### 11.1 The Pioneer Salt & Certification Hash
+Pioneer validates certified 3rd party apps using a double-MD5 hash salt:
 ```kotlin
-// Protocol Layer
-class PProtocolCodec {
-    fun encode(type: Int, data: ByteArray): ByteArray  // → 1024-byte packet
-    fun decode(packet: ByteArray): PProtocolFrame?     // → parsed frame
+fun generateAppCertificationHash(packageName: String): String {
+    val salt = "PionnerKit" // Exact spelling required (notice 'nn')
+    val inner = md5(packageName + salt)
+    return md5(inner).lowercase()
 }
+```
 
-data class PProtocolFrame(
-    val sequence: Int,
-    val sdkVersion: Int,
-    val type: Int,           // 0=SAC, 1=MotionEvent, 2=KeyEvent
-    val payload: ByteArray
-)
+### 11.2 Known Hash Signatures
+- Pioneer AppRadio:
+  - Package: `jp.pioneer.mbg.appradio.AppRadioLauncher`
+  - Hash: `cc8116896fab216025f7dda114f9107f`
+- Pioneer DOP (Dual-Operator Platform):
+  - Package: `jp.pioneer.mbgdop.appradio.AppRadioLauncher`
+  - Hash: `01fc011abd9e9b24176ff811cebac72c`
 
-class WebLinkCodec {
-    fun encode(commandId: Short, payload: ByteArray): ByteArray
-    fun decode(data: ByteArray): WebLinkCommand?
-}
+---
 
-data class WebLinkCommand(
-    val commandId: Short,
-    val payloadSize: Int,
-    val payload: ByteArray
-)
+## 12. App Registration, App Info & Icon Transfer (Stereo Mirror Icon)
 
-class SACCommandParser {
-    fun parse(opcode: Int, data: ByteArray): SACCommand
-}
+The Pioneer head unit features its own on-screen application launcher grid. It discovers apps running on the phone, requests their names, and downloads their icons to display on the head unit dashboard.
 
-sealed class SACCommand {
-    data class Auth(val type: Int, val majorVer: Int, val minorVer: Int) : SACCommand()
-    data class ProductSpec(val width: Int, val height: Int, val pointerCount: Int) : SACCommand()
-    data class Touch(val action: Int, val x: Int, val y: Int) : SACCommand()
-    data class Key(val keyCode: Int, val action: Int) : SACCommand()
-    data class RemoteCtrl(val command: Int) : SACCommand()
-    data class Location(val lat: Double, val lon: Double) : SACCommand()
-    // ... etc
-}
+### 12.1 AppToken System
+- The phone assigns an integer `appToken` (values `1 .. 1024`) to every registered application.
+- The phone maintains a table: `appToken ↔ packageName`.
 
-// USB Layer
-class UsbAccessoryManager(context: Context) {
-    val connectionState: StateFlow<UsbConnectionState>
-    fun connect(accessory: UsbAccessory): Result<UsbConnection>
-    fun disconnect()
-}
+### 12.2 App Name & Package Name Queries
+When the stereo wants details for an `appToken`, it sends:
+- `ID_A2S_APPINFO_REQUEST` (113), Subtype 1 (Name):
+  - Phone replies with `ID_S2A_APPNINFO_RELY` (112), Subtype 1:
+    - `[type: 0x01, appToken: short, strLen: short, utf8_name_bytes + 0x00]`
+- `ID_A2S_APPINFO_REQUEST` (113), Subtype 2 (Package Name):
+  - Phone replies with `ID_S2A_APPNINFO_RELY` (112), Subtype 2:
+    - `[type: 0x02, appToken: short, strLen: short, utf8_pkg_bytes + 0x00]`
 
-// Log Layer
-class ProtocolLogger {
-    val logs: Flow<List<ProtocolLogEntry>>
-    fun log(direction: Direction, raw: ByteArray, parsed: Any)
-    fun exportLogs(): File
-}
+### 12.3 Stereo Mirror Icon Transfer Protocol (Exact Flow)
+
+```
+Head Unit (Stereo)                                        Phone (App)
+──────────────────                                        ───────────
+   │                                                           │
+   │ 1. ID_A2S_APPIMAGE_TRANSFER_REQUEST (121)                 │
+   │    [Subtype: 0x00 (Acquisition),                          │
+   │     appToken: short, imageKind: 0x10 (APPICON),           │
+   │     imageType: 0x12 (PNG=18), width: short, height: short]│
+   │──────────────────────────────────────────────────────────>│
+   │                                                           │ (App resizes icon &
+   │                                                           │  compresses to PNG)
+   │ 2. ID_S2A_APPIMAGE_TRANSFER_NOTIFICATION (120)            │
+   │    [Subtype: 0x00, appToken: short,                       │
+   │     result: 0x00 (OK), totalBytes: int32]                 │
+   │<──────────────────────────────────────────────────────────│
+   │                                                           │
+   │ 3. ID_A2S_APPIMAGE_TRANSFER_REQUEST (121)                 │
+   │    [Subtype: 0x01 (Start Data Transfer), appToken: short] │
+   │──────────────────────────────────────────────────────────>│
+   │                                                           │
+   │ 4. ID_S2A_APPIMAGE_TRANSFER_NOTIFICATION (120)            │
+   │    [Subtype: 0x02 (Chunk Data), appToken: short,          │
+   │     chunkIndex: 0x0000, chunkLen: 512, payload: 512 bytes]│
+   │<──────────────────────────────────────────────────────────│
+   │                                                           │
+   │ 5. ID_A2S_APPIMAGE_TRANSFER_REQUEST (121)                 │
+   │    [Subtype: 0x02 (Chunk ACK),                            │
+   │     appToken: short, ackChunkIndex: 0x0000]               │
+   │──────────────────────────────────────────────────────────>│
+   │                                                           │
+   │ 6. (Repeat steps 4 & 5 until all chunks transferred)      │
+   │    ...                                                    │
+   │                                                           │
+   │ 7. ID_S2A_APPIMAGE_TRANSFER_NOTIFICATION (120)            │
+   │    [Subtype: 0x03 (Transfer Complete),                    │
+   │     appToken: short, endType: 0x00 (Success)]             │
+   │<──────────────────────────────────────────────────────────│
+   │                                                           │
+   │ 8. ID_A2S_APPIMAGE_TRANSFER_REQUEST (121)                 │
+   │    [Subtype: 0x03 (End Confirmed), appToken: short]       │
+   │──────────────────────────────────────────────────────────>│
+```
+
+### 12.4 Image Transfer Parameters
+- **Chunk Size**: Exactly **512 bytes** per packet.
+- **Image Format**: Always **PNG** (`APP_IMAGE_TYPE_PNG = 18`). The stereo checks format 18.
+- **Image Kind**: Always **App Icon** (`APP_IMAGE_KIND_APPICON = 16`).
+- **Maximum Resolution**: 4096 × 4096 (typical requested sizes are 128×128 or 256×256).
+
+---
+
+## 13. App Launch & Remote Navigation Commands
+
+When a user interacts with the head unit UI:
+
+### 13.1 App Launch Commands (`ID_A2S_APPS = 83`)
+1. **Launch Home (`Subtype 0`)**:
+   - User touched the physical or virtual "Home" / "Apps" button on the Pioneer unit.
+   - Payload: `[0x00, 0x00]`.
+   - Action: Phone brings the Launcher / Main mirroring UI to the foreground.
+2. **Launch by Package Name (`Subtype 1`)**:
+   - Payload: `[0x01, utf8_package_name_bytes]`.
+   - Action: Phone checks if package exists and starts its main activity.
+3. **Launch by AppToken (`Subtype 2`)**:
+   - Payload: `[0x02, appToken: short]`.
+   - Action: Phone resolves `appToken` to package name and launches it.
+
+### 13.2 Browser Back Command (`WebLink Command ID: 18`)
+- When the user presses the Back button on the head unit screen:
+  - Stereo sends WebLink `BrowserCommand` (ID: 18) with `action = 0`.
+  - Action: Phone simulates `KeyEvent.KEYCODE_BACK` (keycode 4) on the active display.
+
+---
+
+## 14. Video Output Handshake & Virtual Display Streaming Pipeline
+
+### 14.1 Video Output Activation Flow
+1. Stereo sends SAC opcode 17: `ID_A2S_VEDIO_OUTPUT` (`[0x11]`).
+2. Phone marks `HDMIState = true` and `AdvancedMode = true`.
+3. Phone replies with SAC opcode 16: `ID_S2A_VEDIO_OUTPUT_REPLY` (`[0x06, 0x01]`).
+4. WebLink session initializes:
+   - Phone sends `SetCurrentAppCommand` (ID: 66, payload: `"wlhome_1.0://"`).
+   - Stereo sends `VideoConfigCommand` (ID: 32) specifying destination resolution (e.g., 800×480).
+   - Stereo sends `SET_FPS` (ID: 71, e.g., 30 FPS).
+   - Phone configures `MediaCodec` H.264 encoder.
+   - Phone creates `VirtualDisplay` matching stereo dimensions.
+   - Every encoded frame is wrapped in `FillRectangleCommand` (ID: 1) and sent over USB.
+
+### 14.2 FillRectangleCommand (ID: 1) Frame Structure
+
+```
+WebLink Header (8 bytes):
+  0x57 0x4C, Command ID: 0x0001 (LE), Payload Size: 16 + NAL_Size (LE)
+
+Payload Internal Header (16 bytes, Little-Endian):
+  Bytes 0..3:   Width (int32, e.g. 800)
+  Bytes 4..7:   Height (int32, e.g. 480)
+  Bytes 8..11:  Encoding Type (int32 = 2 for FRAME_ENCODING_H264)
+  Bytes 12..15: App ID (int32 = 0)
+
+Payload Video Data:
+  Bytes 16+:    Raw H.264 NAL Units (SPS, PPS, IDR, P-Frames)
 ```
 
 ---
 
-## Appendix A: MCS TCP/IP Stack
+## 15. Touch Digitizer & Hardware Key Input Relay
 
-> [!NOTE]
-> Abaltatech's MCS layer includes a **userspace TCP/IP stack** (`TCPIPPacket.java`, `TCPIPLayer.java`) that parses raw IPv4 headers and TCP headers (maintains seqNo, ackNo, flags, calculates checksums). This tunnels raw TCP/IP over USB accessory mode to bypass Android networking restrictions without needing root/VPN/tethering.
+### 15.1 WebLink TouchCommand (ID: 72) Structure
+
+```
+Payload Offset   Size   Field        Description
+─────────────────────────────────────────────────────────────────────────────
+0                4      EventType    Little-Endian int32: 0=Begin, 1=Update, 2=End
+4                4      PointCount   Little-Endian int32: Number of touch points (e.g. 1)
+
+For each touch point (20 bytes each):
++0               4      PointerID    Little-Endian int32 (0, 1, 2...)
++4               4      X            Little-Endian int32 (Stereo X coordinate)
++8               4      Y            Little-Endian int32 (Stereo Y coordinate)
++12              4      State        Little-Endian int32:
+                                       1 = Pressed (Down)
+                                       2 = Moved
+                                       4 = Stationary
+                                       8 = Released (Up)
++16              4      Pressure     Little-Endian float (0.0 .. 1.0)
+```
+
+### 15.2 Dispatching Touch to Android Virtual Display
+In our new architecture, we map the coordinates `(X, Y)` from stereo display dimensions to virtual display space:
+```kotlin
+val scaledX = (rawX.toFloat() / stereoWidth) * virtualDisplayWidth
+val scaledY = (rawY.toFloat() / stereoHeight) * virtualDisplayHeight
+
+val motionEvent = MotionEvent.obtain(
+    downTime,
+    eventTime,
+    when (state) {
+        1 -> MotionEvent.ACTION_DOWN
+        2 -> MotionEvent.ACTION_MOVE
+        8 -> MotionEvent.ACTION_UP
+        else -> MotionEvent.ACTION_MOVE
+    },
+    scaledX,
+    scaledY,
+    pressure,
+    1.0f, 0, 1.0f, 1.0f, deviceId, 0
+)
+// Dispatched directly to the presentation window or via InputManager
+```
 
 ---
 
-## Appendix B: Configuration System
+## 16. Audio Focus & AVRCP Remote Control Protocol
 
-### DeviceInfo.xml
-- Downloaded from Pioneer servers at runtime
-- Defines per-model screen parameters (margins, AAM_VR support)
-- Two server URLs: AppRadio and DOP variants
+### 16.1 Audio Focus Handshake
+1. When the stereo switches audio sources, it sends SAC opcode 81 (`ID_A2S_REMOTECTRL`), subtype 1 (`ID_A2S_AUDIOFOCUS_REQUEST`).
+2. Phone evaluates Android `AudioManager` focus:
+   - Request focus: `AudioManager.requestAudioFocus(AUDIOFOCUS_GAIN)`.
+3. Phone replies with SAC opcode 80 (`ID_S2A_SMARTPHONE_AUDIOFOCUS_REPLAY`):
+   - `[type: 0x01, result: 0x01 (OK) or 0x00 (NG)]`.
 
-### Compatible App Lists
-- `ApplicationInfomation` — massive XML parser for compatible app catalog
-- `AplContentFilter` — filters installed apps by compatibility
+### 16.2 AVRCP Commands (`ID_A2S_REMOTECTRL = 81, Subtype 0`)
+The stereo hardware steering-wheel and panel buttons send commands:
+- `0` = Toggle Play/Pause
+- `1` = Play
+- `2` = Pause
+- `3` = Next Track (`TRACKUP`)
+- `4` = Previous Track (`TRACKDOWN`)
+- `5` = Fast Forward (`FF`)
+- `6` = Rewind (`RW`)
 
 ---
 
-## Appendix C: Broadcast Receivers
+## 17. Keepalive, Heartbeat & Session Synchronization
 
-| Receiver | Trigger | Purpose |
+### 17.1 WebLink Session Time Sync (`SYNC_SESSION_TIME = 73`)
+- **Sender**: Stereo head unit sends periodically (typically every 1–2 seconds).
+- **Format**: Two 64-bit Little-Endian longs: `[ClientTime: 8 bytes, ServerTime: 8 bytes]`.
+- **Response Rule**: The phone **must immediately echo** the packet back, retaining the original `ClientTime` and inserting current phone uptime as `ServerTime`:
+  ```kotlin
+  fun handleSyncSessionTime(cmd: SyncSessionTimeCommand) {
+      connection.sendCommand(SyncSessionTimeCommand(
+          cmd.clientTime,
+          SystemClock.uptimeMillis()
+      ))
+  }
+  ```
+
+### 17.2 Data Loss Detection & Timeouts
+- If no packet is received for **15,000 ms (15 seconds)**, the connection is considered dead, triggering an orderly teardown and reset to `STATE_ACCEPT`.
+
+---
+
+## 18. Session Termination & Error Recovery Sequences
+
+### 18.1 Clean Termination
+- Phone sends SAC opcode 2 (`ID_S2A_TERMINATION`), payload `[0x00]`.
+- Stereo sends SAC opcode 3 (`ID_A2S_TERMINATION`).
+- Transport closed cleanly.
+
+### 18.2 Error Recovery in RunableRetry
+- If any handshake stage (Kind 1..7) exceeds its max retry count without receiving an acknowledgment:
+  1. `RunableRetry` logs `disconnectSPP`.
+  2. USB accessory stream is closed.
+  3. `AOAUtilityCommunication` returns to `STATE_ACCEPT (65281)`.
+  4. System waits for accessory re-attachment or resets USB bulk endpoints.
+
+---
+
+## 19. USB Accessory Setup & Intent Filtering
+
+### 19.1 Target Accessory Filter (`accessory_filter.xml`)
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <usb-accessory
+        manufacturer="Pioneer"
+        model="jp.pioneer.ce.aam2.linkwith"
+        version="1" />
+</resources>
+```
+
+### 19.2 AndroidManifest.xml Integration
+```xml
+<activity
+    android:name=".usb.UsbAccessoryActivity"
+    android:exported="true"
+    android:taskAffinity=""
+    android:excludeFromRecents="true"
+    android:noHistory="true">
+    <intent-filter>
+        <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
+    </intent-filter>
+    <meta-data
+        android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
+        android:resource="@xml/accessory_filter" />
+</activity>
+```
+
+---
+
+## 20. Head Unit Hardware Profiles & Model Identification
+
+Reported via `ID_A2S_PROC_SPEC (Opcode 7, Subtype 1)`:
+
+| Model ID (Hex) | Region / Type | Description | Display Spec |
+|---|---|---|---|
+| `0x2002` (8194) | Default Overseas | AppRadio 2/3/4 & SPH-DA series | 800 × 480, 2-point touch |
+| `0x2301` (8961) | Japan Domestic | Carrozzeria CyberNavi / DOP | 800 × 480, multi-touch |
+| `0x1001` .. `0x100C`| Overseas AVH | AVH-X series multimedia units | 800 × 480, single touch |
+| `0x0001` .. `0x0008`| Japan Domestic | AVIC series navigation units | 800 × 480 / WVGA |
+
+---
+
+## 21. Modern Android Migration & Best Practice Replacements
+
+| Legacy AppRadio Pattern | Problem on Modern Android (12+) | Modern Clean Replacement |
 |---|---|---|
-| `AutoBootReceiver` | `BOOT_COMPLETED` | Auto-start service |
-| `AutoStartReceiver` | `android.intent.action.AppRadioLauncher` | Custom start |
-| `PackageChangeReceiver` | `PACKAGE_ADDED/REMOVED` | Refresh app list |
-| `BluetoothHfpReceiver` | `ACL_CONNECTED` | Detect BT device |
-| `UsbReceiver` | `USB_ACCESSORY_ATTACHED` | Detect USB accessory |
+| Internal view-hierarchy scraping (`WLMirrorLayer`) | Reflection blocked by hidden API restrictions | Android `MediaProjection` + `VirtualDisplay` |
+| Native JNI `libPFormat.so` | Unmaintainable 32-bit ARM binaries | Pure Kotlin `PProtocolCodec` & `WebLinkCodec` |
+| `INJECT_EVENTS` system permission | Restricted to system-signed apps | Injecting into app's own `VirtualDisplay` or Accessibility |
+| Deprecated 4-process architecture | Massive IPC overhead, AIDL complexity | Single-process clean architecture with Foreground Service |
+| XML layout spaghetti & legacy Activities | Outdated UI patterns | Modern Jetpack Compose UI with MVI pattern |
+| Raw socket polling loops | High CPU usage & battery drain | Kotlin Coroutines, Channels, and reactive StateFlow |
 
 ---
 
-## Appendix D: Connection States
+## 22. New App Clean Architecture Design
 
-| State | Value (hex) | Description |
-|---|---|---|
-| `STATE_NONE` | 0xFF00 (65280) | No connection |
-| `STATE_ACCEPT` | 0xFF01 (65281) | Waiting for connection |
-| `STATE_CONNECTING` | 0xFF02 (65282) | Connection in progress |
-| `STATE_CONNECTED` | 0xFF03 (65283) | Fully connected |
-| `STATE_EXCEPTION` | 0xFF04 (65284) | Error state |
+```
+:app                     — Application class, Foreground Service, Koin DI assembling
+:core:protocol           — Pure Kotlin implementations:
+                             ├── pprotocol/ (Frame encoding, decoding, CRC)
+                             ├── sac/       (SAC opcodes, state machine, RunableRetry)
+                             ├── weblink/   (WebLink commands, Little-Endian DataBuffer)
+                             └── mtp/       (MTP packet framing, Big-Endian ByteUtils)
+:core:usb                — UsbManager, UsbAccessory connection lifecycle, bulk I/O
+:core:display            — VirtualDisplay creation, Presentation layer, Compose view rendering
+:core:encoder            — Hardware MediaCodec H.264 video encoder (Surface input, Baseline@3.1)
+:core:logging            — High-performance ring buffer logger, packet hex dumper, export engine
+:feature:livelog         — Real-time packet inspector UI (Jetpack Compose, filtering, search)
+:feature:connection      — Stereo connection status, hardware spec display, manual controls
+:feature:mirror          — Main dashboard / mirrored application screen
+```
 
 ---
 
-> **Document Status**: Compiled from deep analysis of decompiled APK source code in [`decompiledApkFiles/sources/`](file:///D:/AppDevelopment/AppRadioRE/decompiledApkFiles/sources).
-> 
-> **Next Steps**: Implement Phase 1 Live Log App using the protocol specifications documented above.
+## 23. Phase 1: Live Log Skeleton App Implementation Plan
+
+Before building the full video streaming pipeline, we build the **Live Log Skeleton App**.
+
+### 23.1 Objectives
+1. Connect to any Pioneer head unit via USB AOA.
+2. Complete the entire `RunableRetry` handshake automatically.
+3. Intercept and log every raw byte, MTP packet, PProtocol frame, and WebLink command.
+4. Display a real-time, color-coded protocol trace in Compose.
+5. Provide instant "Export & Share Logs" feature (email, Google Drive, text) for debugging.
+
+### 23.2 Step-by-Step Execution Plan
+
+```
+Step 1: Protocol Codecs Implementation
+  ├── Create PProtocolCodec (Header 0x89, Tail 0x98, CRC, Big-Endian)
+  ├── Create WebLinkCodec (Header 0x57 0x4C, Little-Endian DataBuffer)
+  └── Create SACCommandCodec (All 22 opcodes and subtypes)
+
+Step 2: USB Transport & Handshake State Machine
+  ├── Implement UsbAccessoryManager with permission & attachment flow
+  └── Implement HandshakeStateMachine faithfully reproducing RunableRetry steps 4 → 5 → 2 → 1 → 3 → 6
+
+Step 3: Logging Engine
+  ├── Ring-buffer memory log repository (capturing raw hex, timestamps, decoded packets)
+  └── File exporter for sharing logs
+
+Step 4: Jetpack Compose Diagnostic UI
+  ├── Connection status banner (USB Attached, Auth, Specs, Connected)
+  ├── Live packet list (auto-scrolling LazyColumn with color-coded direction)
+  ├── Detail inspector dialog (showing decoded fields and raw hex dump)
+  └── Share logs action button
+```
+
+---
+
+> **Document Status**: Complete, fully verified against decompiled source code in `decompiledApkFiles/sources/`. Ready for implementation of Phase 1.
