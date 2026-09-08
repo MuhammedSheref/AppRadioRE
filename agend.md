@@ -30,6 +30,7 @@
 22. [Modern Android Migration & Best Practice Replacements](#22-modern-android-migration--best-practice-replacements)
 23. [New App Clean Architecture Design](#23-new-app-clean-architecture-design)
 24. [Phase 1: Live Log Skeleton App Implementation Plan](#24-phase-1-live-log-skeleton-app-implementation-plan)
+25. [Implementation Status & Completed Milestones](#25-implementation-status--completed-milestones)
 
 ---
 
@@ -217,6 +218,21 @@ Bit:  [15 .. 10]    [9]           [8]           [7 .. 4]       [3 .. 1]       [0
 - `0x00`: Null / None address (Size: 1 byte)
 - `0x01`: IPv4 address (Size: 7 bytes: `1 byte schema + 4 bytes IP + 2 bytes port (Big-Endian)`)
 - `0x02`: IPv6 address (Size: 19 bytes: `1 byte schema + 16 bytes IP + 2 bytes port (Big-Endian)`)
+
+### 6.4 Well-Known MTP Port Assignments
+- **Port 12347 (`WL_CLIENTPORT_CONTROL_CHANNEL`)**: Dedicated TCP stream for all SAC commands, PFormat framed packets, hardware capabilities inquiry, and session handshake.
+- **Port 12346 (`WL_CLIENTPORT_VIDEO_CHANNEL`)**: Dedicated TCP stream for WebLink H.264 video frame transmission to the stereo display.
+- **Port 44477 (`SERVER_CONTROL_PORT`)**: Internal Abalta server control.
+
+### 6.5 PFormat over MTP Wire Encapsulation (Empirical Hardware Finding)
+> [!IMPORTANT]
+> **Real Hardware Handshake Finding**:
+> Pioneer head units running AppRadio Mode 2 (AAM2) over USB AOA do **not** accept bare PFormat frames (`0x9F ... 0x9F 0x03`) directly on the raw USB socket. All PFormat packets must be encapsulated within an MTP TCP Data Packet targeting Port `12347`.
+>
+> 1. Upon USB attachment, the car stereo initiates an MTP connection by sending a probe/SYN packet to port 12347.
+> 2. The phone acknowledges with an empty-payload MTP packet (`MTPCodec.createConnectionAck()`).
+> 3. The phone waits 1000ms (`postDelayed(..., 1000L)`) and initiates `AuthBegin` (`SACCommand.AuthBegin`) encapsulated in an MTP packet.
+> 4. If no response is received, the phone executes a 3-second retry loop (up to 3 attempts, matching Pioneer's `AccessoryAuthor.java`).
 
 ---
 
@@ -931,4 +947,46 @@ Step 4: Jetpack Compose Diagnostic UI
 
 ---
 
-> **Document Status**: Complete, fully verified against decompiled source code in `decompiledApkFiles/sources/`. Ready for implementation of Phase 1.
+## 25. Implementation Status & Completed Milestones
+
+### 25.1 Milestones Completed
+1. **Clean Architecture & Android Best Practices Refactoring**:
+   - Presentation: `LiveLogScreen.kt` modularized into previewable components (`ConnectionStatusCard`, `LogControlBar`, `LogItemCard`, `LogDetailDialog`, `SpecBadge`).
+   - Domain & Error Handling: Type-safe `Result<D, E>` and `DataError.Usb` / `DataError.Protocol` models with `toUiText()` localization helpers.
+   - Data Layer: Low-level `UsbDataSource` stream abstraction isolating `ParcelFileDescriptor` stream I/O from `UsbAccessoryManager`.
+   - Dependency Injection: Layered Koin modules (`CoreLoggingModule`, `CoreUsbModule`, `FeatureLiveLogModule`, `AppModule`).
+
+2. **In-Car Hardware Testing & Protocol Breakthrough**:
+   - Physical USB AOA connection verified on car stereo hardware (`Pioneer jp.pioneer.ce.aam2.linkwith v1.0`).
+   - Discovered and documented the missing **MTP (Multi-Transport Protocol)** transport encapsulation required by the car stereo over USB AOA.
+
+3. **Abalta MTP Framing Codec (`core.protocol.mtp`)**:
+   - Implemented `MTPPacket.kt` with 7-byte IPv4 addresses and options bitfields.
+   - Implemented `MTPCodec.kt` with stream-safe frame un-framing, unconsumed buffer retention, port 12347 control channel encapsulation, and connection ACKs.
+
+4. **Zero-Blind-Spot Raw Wire Logging (`core.usb`)**:
+   - `UsbDataSourceImpl` now immediately logs every raw received chunk (`[RX] [RAW]`) and transmitted chunk (`[TX] [RAW]`) with full byte length and hex preview.
+   - Added `MTP` and `RAW` filter chips to `LogControlBar`.
+
+5. **Adaptive State Machine (`HandshakeStateMachine.kt`)**:
+   - Dual-mode stream parser: handles both MTP-encapsulated frames and bare PFormat frames.
+   - Automated MTP ACK replies to stereo probe packets.
+   - 1000ms delay and 3-second retry loop (up to 3 attempts, matching `AccessoryAuthor.java`).
+
+### 25.2 Test Coverage & Verification
+- **Automated Tests**: 39 of 39 unit tests passing across codecs, logging, state machine, and ViewModel (`./gradlew testDebugUnitTest`).
+- **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` ready for live vehicle testing.
+
+### 25.3 Git Commit History
+- `9f74f6a`: `feat(protocol): introduce Abalta MTP framing codec and packet definitions`
+- `8adee3b`: `feat(logging): add raw USB chunk logging and protocol filter chips`
+- `340b120`: `feat(handshake): integrate MTP transport framing and 3-second retry loop`
+- `f5e444f`: `refactor(di): modularize Koin definitions and add LiveLogViewModel Turbine unit tests`
+- `d27f810`: `refactor(ui): modularize LiveLogScreen into previewable components and add Immutable state annotation`
+- `9843f9e`: `refactor(usb): isolate AOA stream I/O into UsbDataSource and handle errors via Result`
+- `f35eb27`: `refactor(error): introduce type-safe Result wrapper and DataError domain models with unit tests`
+- `7bd01c9`: `docs: add comprehensive architecture, protocol specification, state machine, and developer guides`
+
+---
+
+> **Document Status**: Live, updated with MTP wire transport findings and Phase 1 completion milestones. Ready for on-vehicle verification.
