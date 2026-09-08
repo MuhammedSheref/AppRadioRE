@@ -1,6 +1,7 @@
 package com.ameer.appradiore.feature.livelog
 
 import android.net.Uri
+import androidx.compose.runtime.Immutable
 import com.ameer.appradiore.core.logging.LogEntry
 import com.ameer.appradiore.core.logging.ProtocolType
 import com.ameer.appradiore.core.presentation.UiText
@@ -8,6 +9,7 @@ import com.ameer.appradiore.core.usb.HandshakeStep
 import com.ameer.appradiore.core.usb.StereoSpecs
 import com.ameer.appradiore.core.usb.UsbConnectionState
 
+@Immutable
 data class LiveLogState(
     val connectionState: UsbConnectionState = UsbConnectionState.Disconnected,
     val handshakeStep: HandshakeStep = HandshakeStep.DISCONNECTED,
