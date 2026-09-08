@@ -77,4 +77,37 @@ class HandshakeStateMachineTest {
         val logs = logRepo.logs.first()
         assertTrue(logs.size > 10)
     }
+
+    @Test
+    fun testMtpStreamNegotiationAndAuthResponse() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val testScope = TestScope(testDispatcher)
+
+        val fakeUsb = FakeUsbAccessoryManager()
+        val logRepo = LogRepositoryImpl()
+        val stateMachine = HandshakeStateMachineImpl(fakeUsb, logRepo, testScope)
+        testScope.advanceUntilIdle()
+
+        stateMachine.startHandshake()
+        testScope.testScheduler.advanceTimeBy(1100)
+
+        // Verify that AuthBegin was wrapped in MTP framing (starts with 0x1E, ends with 0x03)
+        assertTrue(fakeUsb.sentBytes.isNotEmpty())
+        val sentMtp = fakeUsb.sentBytes.last()
+        assertEquals(0x1E.toByte(), sentMtp[0])
+        assertEquals(0x03.toByte(), sentMtp[sentMtp.size - 1])
+
+        // Simulate stereo replying with AuthResponse inside an MTP packet
+        val authRespPFormat = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
+            com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_AUTH,
+            byteArrayOf(0x00, 0x00, 0x00, 0x03, 0x00, 0x01)
+        )
+        val authRespMtp = com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapControlChannelPayload(authRespPFormat)
+
+        fakeUsb.incomingBytes.emit(authRespMtp)
+        testScope.advanceUntilIdle()
+
+        // Verify state advanced to STEP_1_START_APP_ACC (as AuthResponse triggers AuthEnd and StartAppAcc)
+        assertEquals(HandshakeStep.STEP_1_START_APP_ACC, stateMachine.currentStep.value)
+    }
 }

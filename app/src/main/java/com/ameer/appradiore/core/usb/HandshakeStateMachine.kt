@@ -3,6 +3,9 @@ package com.ameer.appradiore.core.usb
 import com.ameer.appradiore.core.logging.LogDirection
 import com.ameer.appradiore.core.logging.LogRepository
 import com.ameer.appradiore.core.logging.ProtocolType
+import com.ameer.appradiore.core.protocol.mtp.MTPAddress
+import com.ameer.appradiore.core.protocol.mtp.MTPCodec
+import com.ameer.appradiore.core.protocol.mtp.MTPPacket
 import com.ameer.appradiore.core.protocol.pformat.PFormatCodec
 import com.ameer.appradiore.core.protocol.pformat.PFormatPacket
 import com.ameer.appradiore.core.protocol.sac.SACCodec
@@ -57,6 +60,10 @@ class HandshakeStateMachineImpl(
 
     private var incomingCollectorJob: Job? = null
     private var heartbeatJob: Job? = null
+    private var authJob: Job? = null
+    private var isMtpMode: Boolean = true
+    private var stereoControlPort: Int = MTPPacket.PORT_CONTROL_CHANNEL
+    private var stereoAddress: MTPAddress = MTPAddress.ANY_CONTROL
     private val packetBuffer = ByteArrayOutputStream()
 
     init {
@@ -77,55 +84,115 @@ class HandshakeStateMachineImpl(
 
     override fun startHandshake() {
         reset()
-        incomingCollectorJob = scope.launch(Dispatchers.IO) {
+        isMtpMode = true
+        incomingCollectorJob = scope.launch {
             usbAccessoryManager.incomingBytes.collect { rawBytes ->
                 processIncomingBytes(rawBytes)
             }
         }
 
-        scope.launch(Dispatchers.IO) {
-            _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
+        authJob = scope.launch {
             logRepository.log(
                 direction = LogDirection.INTERNAL,
                 protocol = ProtocolType.SYSTEM,
-                summary = "Starting Pioneer AAM2 Handshake sequence..."
+                summary = "Pioneer AAM2 Transport Initialized. Waiting 1000ms for stereo readiness..."
             )
-            // Send SAC AuthBegin
-            sendSacCommand(SACCommand.AuthBegin)
+            delay(1000)
+
+            _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
+
+            // Retry loop matching Pioneer's AccessoryAuthor: up to 3 attempts, 3000ms apart
+            var attempt = 1
+            while (isActive && attempt <= 3 && _currentStep.value == HandshakeStep.STEP_0_AUTH_BEGIN) {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "Sending AuthBegin (Attempt $attempt of 3)..."
+                )
+                sendSacCommand(SACCommand.AuthBegin)
+                attempt++
+                delay(3000)
+            }
+
+            if (_currentStep.value == HandshakeStep.STEP_0_AUTH_BEGIN) {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "No AuthResponse received after 3 attempts. Stereo may require user confirmation or manual display mode switch.",
+                    isError = true
+                )
+            }
         }
     }
 
     override fun reset() {
         incomingCollectorJob?.cancel()
         incomingCollectorJob = null
+        authJob?.cancel()
+        authJob = null
         heartbeatJob?.cancel()
         heartbeatJob = null
         packetBuffer.reset()
+        isMtpMode = true
+        stereoControlPort = MTPPacket.PORT_CONTROL_CHANNEL
+        stereoAddress = MTPAddress.ANY_CONTROL
         _currentStep.value = HandshakeStep.DISCONNECTED
         _stereoSpecs.value = StereoSpecs()
     }
 
     private suspend fun sendSacCommand(cmd: SACCommand) {
         val payload = SACCodec.encode(cmd)
-        val framed = PFormatCodec.encode(cmd.opcode, payload)
-        val hex = framed.joinToString(" ") { String.format("%02X", it) }
+        val pFormatFramed = PFormatCodec.encode(cmd.opcode, payload)
+        val pFormatHex = pFormatFramed.joinToString(" ") { String.format("%02X", it) }
 
         logRepository.log(
             direction = LogDirection.OUTGOING,
             protocol = ProtocolType.SAC,
             summary = "TX SAC [Opcode 0x${String.format("%02X", cmd.opcode)}]: ${cmd::class.simpleName}",
-            rawHex = hex,
+            rawHex = pFormatHex,
             details = cmd.toString()
         )
 
-        usbAccessoryManager.send(framed)
+        val wireBytes = if (isMtpMode) {
+            val mtpBytes = MTPCodec.wrapControlChannelPayload(
+                payload = pFormatFramed,
+                srcPort = MTPPacket.PORT_CONTROL_CHANNEL,
+                dstPort = stereoControlPort
+            )
+            val mtpHex = mtpBytes.take(64).joinToString(" ") { String.format("%02X", it) }
+            val suffix = if (mtpBytes.size > 64) " ... (${mtpBytes.size}B total)" else ""
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.MTP,
+                summary = "TX MTP Control Channel Packet (Port $stereoControlPort, ${mtpBytes.size}B)",
+                rawHex = mtpHex + suffix
+            )
+            mtpBytes
+        } else {
+            pFormatFramed
+        }
+
+        usbAccessoryManager.send(wireBytes)
     }
 
     private suspend fun processIncomingBytes(bytes: ByteArray) {
         packetBuffer.write(bytes)
         val currentBuffer = packetBuffer.toByteArray()
 
-        // 1. Try PFormat framing
+        // 1. Try MTP framing (0x1E ... 0x03)
+        val mtpResult = MTPCodec.decode(currentBuffer)
+        if (mtpResult.packets.isNotEmpty()) {
+            packetBuffer.reset()
+            if (mtpResult.unconsumedBytes.isNotEmpty()) {
+                packetBuffer.write(mtpResult.unconsumedBytes)
+            }
+            for (packet in mtpResult.packets) {
+                handleMtpPacket(packet)
+            }
+            return
+        }
+
+        // 2. Try bare PFormat framing (0x9F ... 0x9F 0x03)
         val pFormatPackets = PFormatCodec.decode(currentBuffer)
         if (pFormatPackets.isNotEmpty()) {
             packetBuffer.reset()
@@ -135,7 +202,7 @@ class HandshakeStateMachineImpl(
             return
         }
 
-        // 2. Try WebLink framing
+        // 3. Try WebLink framing
         val webLinkCommands = WebLinkCodec.decode(currentBuffer)
         if (webLinkCommands.isNotEmpty()) {
             packetBuffer.reset()
@@ -147,7 +214,70 @@ class HandshakeStateMachineImpl(
 
         // Prevent buffer from growing unbounded if corrupted
         if (packetBuffer.size() > 65536) {
+            val trimmed = currentBuffer.takeLast(4096).toByteArray()
             packetBuffer.reset()
+            packetBuffer.write(trimmed)
+        }
+    }
+
+    private suspend fun handleMtpPacket(packet: MTPPacket) {
+        val proto = if (packet.sourceProtocol == MTPPacket.PROTOCOL_TCP) "TCP" else "UDP"
+        val mtpHex = packet.payload.take(64).joinToString(" ") { String.format("%02X", it) }
+        val suffix = if (packet.payload.size > 64) " ... (${packet.payload.size}B total)" else ""
+        logRepository.log(
+            direction = LogDirection.INCOMING,
+            protocol = ProtocolType.MTP,
+            summary = "RX MTP $proto (Src: ${packet.srcAddress}, Dst: ${packet.dstAddress}, Payload: ${packet.payload.size}B)",
+            rawHex = mtpHex + suffix
+        )
+
+        isMtpMode = true
+        if (packet.srcAddress.port != 0) {
+            stereoControlPort = packet.srcAddress.port
+            stereoAddress = packet.srcAddress
+        }
+
+        // Is it for Control Channel (port 12347)?
+        if (packet.dstAddress.port == MTPPacket.PORT_CONTROL_CHANNEL || packet.srcAddress.port == MTPPacket.PORT_CONTROL_CHANNEL) {
+            if (packet.payload.isEmpty()) {
+                // Empty payload is a channel SYN / connection probe from stereo
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.MTP,
+                    summary = "Control Channel connection requested by stereo. Sending ACK..."
+                )
+                val ack = MTPCodec.createConnectionAck(
+                    srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, MTPPacket.PORT_CONTROL_CHANNEL),
+                    dstAddress = packet.srcAddress
+                )
+                usbAccessoryManager.send(ack)
+                logRepository.log(
+                    direction = LogDirection.OUTGOING,
+                    protocol = ProtocolType.MTP,
+                    summary = "TX MTP Connection ACK sent to ${packet.srcAddress}"
+                )
+            } else {
+                // Decode PFormat inside MTP payload
+                val pFormatPackets = PFormatCodec.decode(packet.payload)
+                if (pFormatPackets.isNotEmpty()) {
+                    for (pPacket in pFormatPackets) {
+                        handlePFormatPacket(pPacket)
+                    }
+                } else {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.MTP,
+                        summary = "Unrecognized payload in Control Channel (${packet.payload.size} bytes)",
+                        rawHex = packet.payload.take(64).joinToString(" ") { String.format("%02X", it) }
+                    )
+                }
+            }
+        } else if (packet.dstAddress.port == MTPPacket.PORT_VIDEO_CHANNEL || packet.srcAddress.port == MTPPacket.PORT_VIDEO_CHANNEL) {
+            logRepository.log(
+                direction = LogDirection.INTERNAL,
+                protocol = ProtocolType.MTP,
+                summary = "Video Channel packet received (${packet.payload.size} bytes)"
+            )
         }
     }
 
@@ -165,6 +295,8 @@ class HandshakeStateMachineImpl(
 
         when (sacCmd) {
             is SACCommand.AuthResponse -> {
+                authJob?.cancel()
+                authJob = null
                 if (sacCmd.result == 0.toByte()) {
                     logRepository.log(
                         direction = LogDirection.INTERNAL,
@@ -255,7 +387,7 @@ class HandshakeStateMachineImpl(
 
     private fun startHeartbeat() {
         heartbeatJob?.cancel()
-        heartbeatJob = scope.launch(Dispatchers.IO) {
+        heartbeatJob = scope.launch {
             while (isActive) {
                 delay(5000)
                 // Heartbeat packet / status query
@@ -268,6 +400,7 @@ class HandshakeStateMachineImpl(
 
     override fun simulateHandshake() {
         reset()
+        isMtpMode = false
         scope.launch {
             logRepository.log(
                 direction = LogDirection.INTERNAL,
