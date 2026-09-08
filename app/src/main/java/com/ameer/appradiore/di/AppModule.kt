@@ -11,8 +11,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import org.koin.android.ext.koin.androidContext
-import org.koin.core.module.dsl.bind
-import org.koin.core.module.dsl.singleOf
 import org.koin.core.module.dsl.viewModel
 import org.koin.dsl.module
 
@@ -21,7 +19,7 @@ val appModule = module {
     single { CoroutineScope(SupervisorJob() + Dispatchers.Default) }
 
     // Logging repository
-    singleOf(::LogRepositoryImpl) { bind<LogRepository>() }
+    single<LogRepository> { LogRepositoryImpl() }
 
     // USB Accessory Manager
     single<UsbAccessoryManager> {

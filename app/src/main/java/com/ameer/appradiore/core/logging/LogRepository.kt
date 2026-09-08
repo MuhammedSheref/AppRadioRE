@@ -29,7 +29,7 @@ interface LogRepository {
     suspend fun exportLogs(context: Context): Uri
 }
 
-class LogRepositoryImpl(
+class LogRepositoryImpl @JvmOverloads constructor(
     private val maxCapacity: Int = 2000
 ) : LogRepository {
 
