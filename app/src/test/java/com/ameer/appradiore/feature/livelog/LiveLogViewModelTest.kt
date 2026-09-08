@@ -13,6 +13,7 @@ import com.ameer.appradiore.core.usb.HandshakeStep
 import com.ameer.appradiore.core.usb.StereoSpecs
 import com.ameer.appradiore.core.usb.UsbAccessoryManager
 import com.ameer.appradiore.core.usb.UsbConnectionState
+import com.ameer.appradiore.core.video.VideoStreamingManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -66,10 +67,31 @@ class LiveLogViewModelTest {
         override fun simulateHandshake() { simulated = true }
     }
 
+    private class FakeVideoStreamingManager : VideoStreamingManager {
+        override val isStreaming = MutableStateFlow(false)
+        override val fps = MutableStateFlow(0)
+        override val framesSent = MutableStateFlow(0L)
+        override val bytesSent = MutableStateFlow(0L)
+
+        var streamingStarted = false
+        var streamingStopped = false
+
+        override fun startStreaming(width: Int, height: Int, fps: Int) {
+            streamingStarted = true
+            isStreaming.value = true
+        }
+
+        override fun stopStreaming() {
+            streamingStopped = true
+            isStreaming.value = false
+        }
+    }
+
     private lateinit var fakeContext: Context
     private lateinit var fakeUsb: FakeUsbAccessoryManager
     private lateinit var fakeStateMachine: FakeHandshakeStateMachine
     private lateinit var logRepository: LogRepositoryImpl
+    private lateinit var fakeVideoStreamingManager: FakeVideoStreamingManager
 
     @Before
     fun setUp() {
@@ -81,6 +103,7 @@ class LiveLogViewModelTest {
         fakeUsb = FakeUsbAccessoryManager()
         fakeStateMachine = FakeHandshakeStateMachine()
         logRepository = LogRepositoryImpl()
+        fakeVideoStreamingManager = FakeVideoStreamingManager()
     }
 
     @After
@@ -90,18 +113,19 @@ class LiveLogViewModelTest {
 
     @Test
     fun testInitialState() = runTest {
-        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository)
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
 
         assertTrue(fakeUsb.listening)
         assertEquals(UsbConnectionState.Disconnected, viewModel.state.value.connectionState)
         assertEquals(HandshakeStep.DISCONNECTED, viewModel.state.value.handshakeStep)
         assertTrue(viewModel.state.value.logs.isEmpty())
         assertTrue(viewModel.state.value.autoScroll)
+        assertFalse(viewModel.state.value.isStreaming)
     }
 
     @Test
     fun testFilteringByProtocol() = runTest {
-        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository)
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
 
         logRepository.log(LogDirection.INCOMING, ProtocolType.SAC, "AuthResponse")
         logRepository.log(LogDirection.INCOMING, ProtocolType.WEBLINK, "TouchCommand")
@@ -129,7 +153,7 @@ class LiveLogViewModelTest {
 
     @Test
     fun testFilteringBySearchQuery() = runTest {
-        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository)
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
 
         logRepository.log(LogDirection.INCOMING, ProtocolType.SAC, "AuthResponse", rawHex = "9F 02 00 9F 03")
         logRepository.log(LogDirection.INCOMING, ProtocolType.SAC, "DisplaySpecInfo", rawHex = "9F 02 01 9F 03")
@@ -152,7 +176,7 @@ class LiveLogViewModelTest {
 
     @Test
     fun testClearLogsAction() = runTest {
-        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository)
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
 
         logRepository.log(LogDirection.INTERNAL, ProtocolType.SYSTEM, "Started")
         assertEquals(1, viewModel.state.value.logs.size)
@@ -164,7 +188,7 @@ class LiveLogViewModelTest {
 
     @Test
     fun testToggleAutoScrollAndSelectLog() = runTest {
-        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository)
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
 
         viewModel.onAction(LiveLogAction.OnToggleAutoScroll(false))
         assertFalse(viewModel.state.value.autoScroll)
@@ -184,9 +208,26 @@ class LiveLogViewModelTest {
 
     @Test
     fun testSimulateHandshakeTriggersStateMachine() = runTest {
-        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository)
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
 
         viewModel.onAction(LiveLogAction.OnSimulateHandshakeClick)
         assertTrue(fakeStateMachine.simulated)
+    }
+
+    @Test
+    fun testToggleVideoStreamAction() = runTest {
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
+
+        assertFalse(viewModel.state.value.isStreaming)
+
+        // Toggle on
+        viewModel.onAction(LiveLogAction.OnToggleVideoStream(true))
+        assertTrue(fakeVideoStreamingManager.streamingStarted)
+        assertTrue(viewModel.state.value.isStreaming)
+
+        // Toggle off
+        viewModel.onAction(LiveLogAction.OnToggleVideoStream(false))
+        assertTrue(fakeVideoStreamingManager.streamingStopped)
+        assertFalse(viewModel.state.value.isStreaming)
     }
 }

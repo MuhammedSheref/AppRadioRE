@@ -11,7 +11,8 @@ val featureLiveLogModule = module {
             context = androidContext(),
             usbAccessoryManager = get(),
             handshakeStateMachine = get(),
-            logRepository = get()
+            logRepository = get(),
+            videoStreamingManager = get()
         )
     }
 }

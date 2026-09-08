@@ -20,7 +20,11 @@ data class LiveLogState(
     val searchQuery: String = "",
     val autoScroll: Boolean = true,
     val selectedLogEntry: LogEntry? = null,
-    val isExporting: Boolean = false
+    val isExporting: Boolean = false,
+    val isStreaming: Boolean = false,
+    val streamFps: Int = 0,
+    val streamFramesSent: Long = 0L,
+    val streamBytesSent: Long = 0L
 )
 
 sealed interface LiveLogAction {
@@ -32,6 +36,7 @@ sealed interface LiveLogAction {
     data class OnSearchQueryChange(val query: String) : LiveLogAction
     data class OnToggleAutoScroll(val enabled: Boolean) : LiveLogAction
     data class OnSelectLogEntry(val entry: LogEntry?) : LiveLogAction
+    data class OnToggleVideoStream(val enable: Boolean) : LiveLogAction
 }
 
 sealed interface LiveLogEvent {

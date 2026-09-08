@@ -8,7 +8,9 @@ import com.ameer.appradiore.core.logging.LogRepository
 import com.ameer.appradiore.core.logging.ProtocolType
 import com.ameer.appradiore.core.presentation.UiText
 import com.ameer.appradiore.core.usb.HandshakeStateMachine
+import com.ameer.appradiore.core.usb.HandshakeStep
 import com.ameer.appradiore.core.usb.UsbAccessoryManager
+import com.ameer.appradiore.core.video.VideoStreamingManager
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,7 +22,8 @@ class LiveLogViewModel(
     private val context: Context,
     private val usbAccessoryManager: UsbAccessoryManager,
     private val handshakeStateMachine: HandshakeStateMachine,
-    private val logRepository: LogRepository
+    private val logRepository: LogRepository,
+    private val videoStreamingManager: VideoStreamingManager
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(LiveLogState())
@@ -36,6 +39,11 @@ class LiveLogViewModel(
         viewModelScope.launch {
             usbAccessoryManager.connectionState.collect { connectionState ->
                 _state.update { it.copy(connectionState = connectionState) }
+                if (connectionState is com.ameer.appradiore.core.usb.UsbConnectionState.Disconnected ||
+                    connectionState is com.ameer.appradiore.core.usb.UsbConnectionState.Error
+                ) {
+                    videoStreamingManager.stopStreaming()
+                }
             }
         }
 
@@ -43,6 +51,9 @@ class LiveLogViewModel(
         viewModelScope.launch {
             handshakeStateMachine.currentStep.collect { step ->
                 _state.update { it.copy(handshakeStep = step) }
+                if (step == HandshakeStep.DISCONNECTED || step == HandshakeStep.FAILED) {
+                    videoStreamingManager.stopStreaming()
+                }
             }
         }
 
@@ -50,6 +61,28 @@ class LiveLogViewModel(
         viewModelScope.launch {
             handshakeStateMachine.stereoSpecs.collect { specs ->
                 _state.update { it.copy(stereoSpecs = specs) }
+            }
+        }
+
+        // Observe Video Streaming metrics
+        viewModelScope.launch {
+            videoStreamingManager.isStreaming.collect { isStreaming ->
+                _state.update { it.copy(isStreaming = isStreaming) }
+            }
+        }
+        viewModelScope.launch {
+            videoStreamingManager.fps.collect { fps ->
+                _state.update { it.copy(streamFps = fps) }
+            }
+        }
+        viewModelScope.launch {
+            videoStreamingManager.framesSent.collect { frames ->
+                _state.update { it.copy(streamFramesSent = frames) }
+            }
+        }
+        viewModelScope.launch {
+            videoStreamingManager.bytesSent.collect { bytes ->
+                _state.update { it.copy(streamBytesSent = bytes) }
             }
         }
 
@@ -66,6 +99,7 @@ class LiveLogViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        videoStreamingManager.stopStreaming()
         usbAccessoryManager.stopListening()
     }
 
@@ -100,6 +134,15 @@ class LiveLogViewModel(
             }
             is LiveLogAction.OnSelectLogEntry -> {
                 _state.update { it.copy(selectedLogEntry = action.entry) }
+            }
+            is LiveLogAction.OnToggleVideoStream -> {
+                if (action.enable) {
+                    val width = if (_state.value.stereoSpecs.width > 0) _state.value.stereoSpecs.width else 800
+                    val height = if (_state.value.stereoSpecs.height > 0) _state.value.stereoSpecs.height else 480
+                    videoStreamingManager.startStreaming(width = width, height = height, fps = 30)
+                } else {
+                    videoStreamingManager.stopStreaming()
+                }
             }
         }
     }

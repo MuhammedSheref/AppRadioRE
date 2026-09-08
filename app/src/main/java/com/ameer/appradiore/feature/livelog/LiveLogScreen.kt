@@ -168,7 +168,12 @@ fun LiveLogScreen(
             ConnectionStatusCard(
                 connectionState = state.connectionState,
                 handshakeStep = state.handshakeStep,
-                stereoSpecs = state.stereoSpecs
+                stereoSpecs = state.stereoSpecs,
+                isStreaming = state.isStreaming,
+                streamFps = state.streamFps,
+                streamFramesSent = state.streamFramesSent,
+                streamBytesSent = state.streamBytesSent,
+                onToggleVideoStream = { onAction(LiveLogAction.OnToggleVideoStream(it)) }
             )
 
             LogControlBar(

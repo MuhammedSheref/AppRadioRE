@@ -985,21 +985,43 @@ Step 4: Jetpack Compose Diagnostic UI
    - `UsbDataSourceImpl` logs every raw received chunk (`[RX] [RAW]`) and transmitted chunk (`[TX] [RAW]`) with byte length and hex dump.
    - `ConnectionStatusCard` dynamically displays screen resolution with DPI badge (e.g. `800x480 (240DPI)`).
 
-### 25.2 Test Coverage & Verification
-- **Automated Tests**: 43 of 43 unit tests passing across codecs, logging, state machine, and ViewModel (`./gradlew testDebugUnitTest`).
-- **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` built and ready for physical hardware verification.
+### 25.2 Phase 2: Video Pipeline & Test Pattern Implementation (COMPLETED)
+1. **Stereo Mirror Mode Activation (`SetCurrentAppCommand`)**:
+   - Decompiled from `WLServer.java` and `SetCurrentAppCommand.java` (ID 66).
+   - Wire format: `[Int32 appIdLength][appId bytes][Int32 appParamsLength][appParams bytes]` (Little-Endian).
+   - Automated trigger: Upon completing `VideoConfig Confirm`, `HandshakeStateMachine` transmits `SetCurrentApp("wlhome_1.0://", "")` over both Video Channel (Port 12346) and Control Channel (Port 12347) encapsulated in MTP packets.
+   - Activates the Pioneer head unit mirror display canvas.
 
-### 25.3 Git Commit History
-- `9f74f6a`: `feat(protocol): introduce Abalta MTP framing codec and packet definitions`
-- `8adee3b`: `feat(logging): add raw USB chunk logging and protocol filter chips`
-- `340b120`: `feat(handshake): integrate MTP transport framing and 3-second retry loop`
-- `e508fa9`: `docs: update agend.md with MTP framing discoveries and completed milestones`
-- `f5e444f`: `refactor(di): modularize Koin definitions and add LiveLogViewModel Turbine unit tests`
-- `d27f810`: `refactor(ui): modularize LiveLogScreen into previewable components and add Immutable state annotation`
-- `9843f9e`: `refactor(usb): isolate AOA stream I/O into UsbDataSource and handle errors via Result`
-- `f35eb27`: `refactor(error): introduce type-safe Result wrapper and DataError domain models with unit tests`
-- `7bd01c9`: `docs: add comprehensive architecture, protocol specification, state machine, and developer guides`
+2. **Android MediaCodec Surface H.264 Video Encoder (`core.video.H264VideoEncoder`)**:
+   - Resolution: 800 x 480 @ 30 FPS.
+   - Bitrate: 8,388,608 bps (8 Mbps) matching Pioneer hardware requirement.
+   - Color Format: `COLOR_FormatSurface` for direct hardware rendering.
+   - Keyframe Interval: 1s (`KEY_I_FRAME_INTERVAL = 1`).
+   - Automatically captures SPS/PPS parameter sets (`BUFFER_FLAG_CODEC_CONFIG`) and prepends them to keyframes (`BUFFER_FLAG_KEY_FRAME`) to ensure car stereo hardware decoders never drop video frames.
+
+3. **High-Contrast 30 FPS Automotive Test Pattern (`core.video.TestPatternRenderer`)**:
+   - Zero-copy hardware Canvas rendering onto the MediaCodec input `Surface`.
+   - Dark tech automotive theme with header, corner calibration crosshairs (for overscan checks), and specs (`800x480 @ 240 DPI | 30 FPS`).
+   - Dynamic real-time clock (`HH:mm:ss.SSS`), frame counter (`FRAME: #000452`), horizontal scanning bar, and animated bouncing neon orb to provide unambiguous visual proof of fluid 30 FPS hardware video on the Pioneer stereo.
+
+4. **Video Streaming Manager (`core.video.VideoStreamingManager`)**:
+   - Packages H.264 frames into `WebLinkCommand.FillRectangle(width=800, height=480, encodingType=2, appId=0, frameData=frame)`.
+   - Wraps in MTP packets targeting Video Channel (`Port 12346`).
+   - Streams over USB via `UsbAccessoryManager.send()`.
+   - Tracks live performance metrics: `isStreaming`, `fps`, `framesSent`, `bytesSent`.
+
+5. **Diagnostic UI Controls & Live Metrics (`ConnectionStatusCard`)**:
+   - Added interactive "STREAM VIDEO" / "STOP" action button when handshake reaches `CONNECTED_READY`.
+   - Animated pulsing indicator: `STREAMING (H.264 @ Port 12346)`.
+   - Live streaming badges: `FPS`, `Frames`, `Sent MB`.
+
+### 25.3 Test Coverage & Verification
+- **Automated Tests**: 46 of 46 unit tests passing across all layers (`./gradlew testDebugUnitTest`):
+  - `WebLinkCodecTest`: 1-byte `SetFps`, length-prefixed `SetCurrentApp`, and `FillRectangle` round-trips.
+  - `VideoStreamingManagerTest`: Lifecycle, H.264 frame packaging, and MTP Port 12346 wire wrapping.
+  - `LiveLogViewModelTest`: Video streaming actions and state observers.
+- **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` built and ready for physical hardware verification.
 
 ---
 
-> **Document Status**: Live, updated with WebLink-over-MTP display unlock confirmation and session completion implementation. Ready for physical hardware testing.
+> **Document Status**: Live, updated with Phase 2 Video Pipeline, MediaCodec Surface encoder, and 30 FPS Test Pattern streaming. Ready for in-car hardware display testing.
