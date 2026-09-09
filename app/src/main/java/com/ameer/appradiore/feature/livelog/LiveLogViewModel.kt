@@ -3,6 +3,7 @@ package com.ameer.appradiore.feature.livelog
 import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.ameer.appradiore.core.logging.LogDirection
 import com.ameer.appradiore.core.logging.LogEntry
 import com.ameer.appradiore.core.logging.LogRepository
 import com.ameer.appradiore.core.logging.ProtocolType
@@ -10,6 +11,7 @@ import com.ameer.appradiore.core.presentation.UiText
 import com.ameer.appradiore.core.usb.HandshakeStateMachine
 import com.ameer.appradiore.core.usb.HandshakeStep
 import com.ameer.appradiore.core.usb.UsbAccessoryManager
+import com.ameer.appradiore.core.usb.UsbConnectionState
 import com.ameer.appradiore.core.video.VideoStreamingManager
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -53,6 +55,10 @@ class LiveLogViewModel(
                 _state.update { it.copy(handshakeStep = step) }
                 if (step == HandshakeStep.DISCONNECTED || step == HandshakeStep.FAILED) {
                     videoStreamingManager.stopStreaming()
+                } else if (step == HandshakeStep.CONNECTED_READY) {
+                    val width = if (_state.value.stereoSpecs.width > 0) _state.value.stereoSpecs.width else 800
+                    val height = if (_state.value.stereoSpecs.height > 0) _state.value.stereoSpecs.height else 480
+                    videoStreamingManager.startStreaming(width = width, height = height, fps = 30)
                 }
             }
         }
@@ -109,7 +115,16 @@ class LiveLogViewModel(
                 usbAccessoryManager.scanForAccessory()
             }
             is LiveLogAction.OnSimulateHandshakeClick -> {
-                handshakeStateMachine.simulateHandshake()
+                if (_state.value.connectionState is UsbConnectionState.Connected) {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.SYSTEM,
+                        summary = "USB device connected. Triggering real Pioneer handshake restart..."
+                    )
+                    handshakeStateMachine.restartHandshake()
+                } else {
+                    handshakeStateMachine.simulateHandshake()
+                }
             }
             is LiveLogAction.OnClearLogsClick -> {
                 logRepository.clearLogs()

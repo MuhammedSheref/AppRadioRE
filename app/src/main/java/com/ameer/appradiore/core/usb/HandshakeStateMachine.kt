@@ -33,6 +33,7 @@ enum class HandshakeStep(val description: String) {
     STEP_4_REQUEST_DISPLAY("Kind 1: Requesting Display Specs"),
     STEP_5_REQUEST_STATUS("Kind 3: Requesting Accessory Status"),
     STEP_6_END_ACC_INFO("Kind 6: Ending Accessory Info"),
+    STEP_7_APP_INFO("Step 7: Exchanging App Catalog & Icon"),
     CONNECTED_READY("Handshake Complete (Ready for Mirroring)"),
     FAILED("Handshake Failed")
 }
@@ -42,6 +43,7 @@ interface HandshakeStateMachine {
     val stereoSpecs: StateFlow<StereoSpecs>
 
     fun startHandshake()
+    fun restartHandshake()
     fun reset()
     fun simulateHandshake()
 }
@@ -61,7 +63,9 @@ class HandshakeStateMachineImpl(
     private var incomingCollectorJob: Job? = null
     private var heartbeatJob: Job? = null
     private var authJob: Job? = null
+    private var fallbackJob: Job? = null
     private var isMtpMode: Boolean = true
+    private var isSacAuthenticated: Boolean = false
     private var stereoControlPort: Int = MTPPacket.PORT_CONTROL_CHANNEL
     private var stereoAddress: MTPAddress = MTPAddress.ANY_CONTROL
     private val packetBuffer = ByteArrayOutputStream()
@@ -82,43 +86,83 @@ class HandshakeStateMachineImpl(
         }
     }
 
+    override fun restartHandshake() {
+        startHandshake()
+    }
+
     override fun startHandshake() {
         reset()
         isMtpMode = true
+        _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
+        logRepository.log(
+            direction = LogDirection.INTERNAL,
+            protocol = ProtocolType.SYSTEM,
+            summary = "Pioneer AAM2 Transport Initialized. Awaiting stereo MTP Control Channel (Port 12347)..."
+        )
         incomingCollectorJob = scope.launch {
             usbAccessoryManager.incomingBytes.collect { rawBytes ->
                 processIncomingBytes(rawBytes)
             }
         }
 
-        authJob = scope.launch {
-            logRepository.log(
-                direction = LogDirection.INTERNAL,
-                protocol = ProtocolType.SYSTEM,
-                summary = "Pioneer AAM2 Transport Initialized. Waiting 1000ms for stereo readiness..."
-            )
-            delay(1000)
-
-            _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
-
-            // Retry loop matching Pioneer's AccessoryAuthor: up to 3 attempts, 3000ms apart
-            var attempt = 1
-            while (isActive && attempt <= 3 && _currentStep.value == HandshakeStep.STEP_0_AUTH_BEGIN) {
+        // Fallback for legacy non-MTP direct USB Pioneer head units (e.g. raw PFormat over USB).
+        // If no MTP connection request is received within 4 seconds, initiate bare AuthBegin.
+        fallbackJob = scope.launch {
+            delay(4000L)
+            if (!isSacAuthenticated && authJob == null) {
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SYSTEM,
-                    summary = "Sending AuthBegin (Attempt $attempt of 3)..."
+                    summary = "No MTP connection request received within 4s. Attempting fallback direct AuthBegin..."
                 )
-                sendSacCommand(SACCommand.AuthBegin)
-                attempt++
-                delay(3000)
+                isMtpMode = false
+                scheduleAuthSequence(delayMs = 0L, source = "Non-MTP Fallback")
+            }
+        }
+    }
+
+    private fun scheduleAuthSequence(delayMs: Long, source: String) {
+        authJob?.cancel()
+        authJob = scope.launch {
+            if (delayMs > 0) {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "Pioneer AAM2 Transport ($source). Waiting ${delayMs}ms for stereo readiness..."
+                )
+                delay(delayMs)
             }
 
-            if (_currentStep.value == HandshakeStep.STEP_0_AUTH_BEGIN) {
+            if (_currentStep.value == HandshakeStep.DISCONNECTED) {
+                _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
+            }
+
+            // Retry loop matching Pioneer's AccessoryAuthor: up to 5 attempts, 2500ms apart
+            var attempt = 1
+            while (isActive && attempt <= 5 && !isSacAuthenticated) {
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SYSTEM,
-                    summary = "No AuthResponse received after 3 attempts. Stereo may require user confirmation or manual display mode switch.",
+                    summary = "Sending AuthBegin (Attempt $attempt of 5)..."
+                )
+                // If retrying, re-send MTP Connection ACK for Port 12347 to ensure socket state is synced
+                if (attempt > 1 && isMtpMode) {
+                    val ack = MTPCodec.createConnectionAck(
+                        srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, stereoAddress.ip, MTPPacket.PORT_CONTROL_CHANNEL),
+                        dstAddress = stereoAddress
+                    )
+                    usbAccessoryManager.send(ack)
+                }
+                sendSacCommand(SACCommand.AuthBegin)
+                attempt++
+                delay(2500L)
+            }
+
+            if (!isSacAuthenticated && _currentStep.value != HandshakeStep.CONNECTED_READY) {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "No AuthResponse received after 5 attempts. Stereo may require returning to Home Menu or reconnecting.",
                     isError = true
                 )
             }
@@ -130,10 +174,13 @@ class HandshakeStateMachineImpl(
         incomingCollectorJob = null
         authJob?.cancel()
         authJob = null
+        fallbackJob?.cancel()
+        fallbackJob = null
         heartbeatJob?.cancel()
         heartbeatJob = null
         packetBuffer.reset()
         isMtpMode = true
+        isSacAuthenticated = false
         stereoControlPort = MTPPacket.PORT_CONTROL_CHANNEL
         stereoAddress = MTPAddress.ANY_CONTROL
         _currentStep.value = HandshakeStep.DISCONNECTED
@@ -251,7 +298,7 @@ class HandshakeStateMachineImpl(
             )
             val ackPort = if (isVideo) MTPPacket.PORT_VIDEO_CHANNEL else MTPPacket.PORT_CONTROL_CHANNEL
             val ack = MTPCodec.createConnectionAck(
-                srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, ackPort),
+                srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, packet.srcAddress.ip, ackPort),
                 dstAddress = packet.srcAddress
             )
             usbAccessoryManager.send(ack)
@@ -260,6 +307,24 @@ class HandshakeStateMachineImpl(
                 protocol = ProtocolType.MTP,
                 summary = "TX MTP Connection ACK sent to ${packet.srcAddress}"
             )
+
+            if (isControl && !isSacAuthenticated) {
+                // Cancel fallback timer since MTP control channel exists
+                fallbackJob?.cancel()
+                fallbackJob = null
+
+                // Match Pioneer ProtocolDispatcherImpl: ignore duplicate SYN re-triggers if channel already connecting/connected
+                if (authJob == null || authJob?.isActive != true) {
+                    // Per Pioneer ExtBaseService: onControlChannelReady() -> handleConnecting() -> postDelayed(1000ms) -> onRemoteAuthBegin()
+                    scheduleAuthSequence(delayMs = 1000L, source = "Control Channel Port 12347 Established")
+                } else {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.MTP,
+                        summary = "Duplicate Control Channel SYN ACKed. Auth sequence already active."
+                    )
+                }
+            }
             return
         }
 
@@ -319,13 +384,14 @@ class HandshakeStateMachineImpl(
 
         when (sacCmd) {
             is SACCommand.AuthResponse -> {
+                isSacAuthenticated = true
                 authJob?.cancel()
                 authJob = null
-                if (sacCmd.result == 0.toByte()) {
+                if (sacCmd.isSuccess) {
                     logRepository.log(
                         direction = LogDirection.INTERNAL,
                         protocol = ProtocolType.SAC,
-                        summary = "Auth Succeeded! Stereo Version: ${sacCmd.majorVersion}.${sacCmd.minorVersion}"
+                        summary = "Auth Succeeded! Code: ${sacCmd.result}, Stereo Version: ${sacCmd.majorVersion}.${sacCmd.minorVersion}"
                     )
                     _currentStep.value = HandshakeStep.STEP_0_AUTH_END
                     // Send AuthEnd confirmation
@@ -375,26 +441,162 @@ class HandshakeStateMachineImpl(
                     isParkingBrakeOn = sacCmd.isParkingBrakeOn,
                     isHdmiConnected = sacCmd.isHdmiConnected
                 )
-                _currentStep.value = HandshakeStep.STEP_6_END_ACC_INFO
-                sendSacCommand(SACCommand.EndAccessoryInfo)
+                // Only send EndAccessoryInfo during the initial setup phase; ignore periodic updates
+                if (_currentStep.value == HandshakeStep.STEP_5_REQUEST_STATUS) {
+                    _currentStep.value = HandshakeStep.STEP_6_END_ACC_INFO
+                    sendSacCommand(SACCommand.EndAccessoryInfo)
+                }
             }
-            is SACCommand.EndAccessoryInfoReply -> {
-                _currentStep.value = HandshakeStep.CONNECTED_READY
-                _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
+            is SACCommand.RequestPhoneStatus -> {
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
-                    protocol = ProtocolType.SYSTEM,
-                    summary = "Handshake successfully completed! Stereo is ready for mirroring."
+                    protocol = ProtocolType.SAC,
+                    summary = "Stereo requested SmartPhoneStatus (type: 0x${String.format("%02X", sacCmd.statusType)}). Replying with SmartPhoneStatus..."
                 )
+                sendSacCommand(SACCommand.SmartPhoneStatus(statusType = sacCmd.statusType))
+            }
+            is SACCommand.EndAccessoryInfoReply -> {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Accessory Info acknowledged by stereo. Awaiting App Info / Video Output request..."
+                )
+            }
+            is SACCommand.StartAppInfo -> {
+                _currentStep.value = HandshakeStep.STEP_7_APP_INFO
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Stereo requested App Info. Sending StartAppInfoReply..."
+                )
+                sendSacCommand(SACCommand.StartAppInfoReply(status = 1))
+            }
+            is SACCommand.AppInfoRequest -> {
+                _currentStep.value = HandshakeStep.STEP_7_APP_INFO
+                when (sacCmd.requestType.toInt()) {
+                    1 -> {
+                        logRepository.log(
+                            direction = LogDirection.INTERNAL,
+                            protocol = ProtocolType.SAC,
+                            summary = "Stereo queried App Name (token ${sacCmd.appToken}). Replying 'AppRadio'"
+                        )
+                        sendSacCommand(SACCommand.AppNameReply(appToken = sacCmd.appToken, appName = "AppRadio"))
+                    }
+                    2 -> {
+                        logRepository.log(
+                            direction = LogDirection.INTERNAL,
+                            protocol = ProtocolType.SAC,
+                            summary = "Stereo queried Package Name (token ${sacCmd.appToken}). Replying 'jp.pioneer.mbg.appradio.AppRadioLauncher'"
+                        )
+                        sendSacCommand(SACCommand.PackageNameReply(appToken = sacCmd.appToken, packageName = "jp.pioneer.mbg.appradio.AppRadioLauncher"))
+                    }
+                    else -> {
+                        logRepository.log(
+                            direction = LogDirection.INTERNAL,
+                            protocol = ProtocolType.SAC,
+                            summary = "Unknown AppInfoRequest type: ${sacCmd.requestType}"
+                        )
+                    }
+                }
+            }
+            is SACCommand.AppImageRequest -> {
+                _currentStep.value = HandshakeStep.STEP_7_APP_INFO
+                when (sacCmd.subType.toInt()) {
+                    0 -> { // Acquisition query
+                        logRepository.log(
+                            direction = LogDirection.INTERNAL,
+                            protocol = ProtocolType.SAC,
+                            summary = "Stereo queried App Image acquisition (token ${sacCmd.appToken}). Replying size: ${DEFAULT_ICON_PNG.size}B"
+                        )
+                        sendSacCommand(
+                            SACCommand.AppImageAcquisitionReply(
+                                appToken = sacCmd.appToken,
+                                result = 0,
+                                totalPayloadSize = DEFAULT_ICON_PNG.size
+                            )
+                        )
+                    }
+                    1 -> { // Start data transfer
+                        val chunkSize = minOf(DEFAULT_ICON_PNG.size, 512)
+                        val chunkData = DEFAULT_ICON_PNG.copyOfRange(0, chunkSize)
+                        logRepository.log(
+                            direction = LogDirection.INTERNAL,
+                            protocol = ProtocolType.SAC,
+                            summary = "Stereo started App Image transfer. Sending chunk 0 ($chunkSize bytes)"
+                        )
+                        sendSacCommand(
+                            SACCommand.AppImageChunk(
+                                appToken = sacCmd.appToken,
+                                chunkIndex = 0,
+                                chunkData = chunkData
+                            )
+                        )
+                    }
+                    2 -> { // Chunk ACK
+                        val nextChunkIndex = (sacCmd.ackChunkIndex + 1).toShort()
+                        val offset = nextChunkIndex.toInt() * 512
+                        if (offset < DEFAULT_ICON_PNG.size) {
+                            val chunkSize = minOf(DEFAULT_ICON_PNG.size - offset, 512)
+                            val chunkData = DEFAULT_ICON_PNG.copyOfRange(offset, offset + chunkSize)
+                            logRepository.log(
+                                direction = LogDirection.INTERNAL,
+                                protocol = ProtocolType.SAC,
+                                summary = "Sending App Image chunk $nextChunkIndex ($chunkSize bytes)"
+                            )
+                            sendSacCommand(
+                                SACCommand.AppImageChunk(
+                                    appToken = sacCmd.appToken,
+                                    chunkIndex = nextChunkIndex,
+                                    chunkData = chunkData
+                                )
+                            )
+                        } else {
+                            logRepository.log(
+                                direction = LogDirection.INTERNAL,
+                                protocol = ProtocolType.SAC,
+                                summary = "All App Image chunks sent. Sending AppImageEnd (OK)"
+                            )
+                            sendSacCommand(SACCommand.AppImageEnd(appToken = sacCmd.appToken, endType = 0))
+                        }
+                    }
+                    3 -> {
+                        logRepository.log(
+                            direction = LogDirection.INTERNAL,
+                            protocol = ProtocolType.SAC,
+                            summary = "Stereo acknowledged App Image transfer complete."
+                        )
+                    }
+                }
+            }
+            is SACCommand.EndAppInfo -> {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Stereo finished App Info exchange. Replying EndAppInfoReply and sending EndAppAcc..."
+                )
+                sendSacCommand(SACCommand.EndAppInfoReply(status = 1))
+                sendSacCommand(SACCommand.EndAppAcc)
+            }
+            is SACCommand.EndAppAccReply -> {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Stereo acknowledged EndAppAcc. Handshake complete, mirror canvas ready!"
+                )
+                _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
+                _currentStep.value = HandshakeStep.CONNECTED_READY
                 startHeartbeat()
             }
             is SACCommand.VideoOutputRequest -> {
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SAC,
-                    summary = "Received VideoOutputRequest from stereo -> Replying OK"
+                    summary = "Stereo requested VideoOutput -> Pioneer Display Canvas Unlocked! Replying OK."
                 )
                 sendSacCommand(SACCommand.VideoOutputReply)
+                _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
+                _currentStep.value = HandshakeStep.CONNECTED_READY
+                startHeartbeat()
             }
             else -> Unit
         }
@@ -451,13 +653,10 @@ class HandshakeStateMachineImpl(
                 val h = cmd.clientHeight.takeIf { it > 0 } ?: cmd.sourceHeight
                 _stereoSpecs.value = _stereoSpecs.value.copy(
                     width = w,
-                    height = h,
-                    isReadyForVideo = true
+                    height = h
                 )
 
-                // Cancel auth retry loop since stereo established WebLink session
-                authJob?.cancel()
-                authJob = null
+                // NOTE: Do NOT cancel authJob! WebLink (Port 12346) and SAC (Port 12347) are concurrent channels.
 
                 // Reply confirming video config: 800x480 H.264
                 val reply = WebLinkCommand.VideoConfig(
@@ -487,22 +686,21 @@ class HandshakeStateMachineImpl(
                     usbAccessoryManager.send(replyBytes)
                 }
 
-                _currentStep.value = HandshakeStep.CONNECTED_READY
                 val dpiText = if (_stereoSpecs.value.dpi > 0) " @ ${_stereoSpecs.value.dpi} DPI" else ""
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SYSTEM,
-                    summary = "=== HANDSHAKE COMPLETE: Stereo Display Unlocked (${w}x${h}$dpiText) ==="
+                    summary = "=== WebLink Video Negotiated (${w}x${h}$dpiText) ==="
                 )
 
-                // Trigger stereo mirror screen: SetCurrentApp("wlhome_1.0://")
-                val setAppCmd = WebLinkCommand.SetCurrentApp(appId = "wlhome_1.0://", appParams = "")
+                // Trigger stereo mirror screen: SetCurrentApp("aam2serverapp://") ONLY on Port 12346 (Video Channel)
+                val setAppCmd = WebLinkCommand.SetCurrentApp(appId = WebLinkCommand.APP_ID_AAM2, appParams = "")
                 val setAppBytes = WebLinkCodec.encode(setAppCmd)
                 val setAppHex = setAppBytes.take(64).joinToString(" ") { String.format("%02X", it) }
                 logRepository.log(
                     direction = LogDirection.OUTGOING,
                     protocol = ProtocolType.WEBLINK,
-                    summary = "TX WebLink: SetCurrentApp (\"wlhome_1.0://\") -> Activate Mirror Screen",
+                    summary = "TX WebLink: SetCurrentApp (\"${WebLinkCommand.APP_ID_AAM2}\") -> Activate Mirror Screen",
                     rawHex = setAppHex
                 )
                 if (isMtpMode) {
@@ -512,19 +710,9 @@ class HandshakeStateMachineImpl(
                         dstPort = channelPort
                     )
                     usbAccessoryManager.send(setAppMtpVideo)
-                    if (channelPort != MTPPacket.PORT_CONTROL_CHANNEL) {
-                        val setAppMtpControl = MTPCodec.wrapControlChannelPayload(
-                            payload = setAppBytes,
-                            srcPort = MTPPacket.PORT_CONTROL_CHANNEL,
-                            dstPort = MTPPacket.PORT_CONTROL_CHANNEL
-                        )
-                        usbAccessoryManager.send(setAppMtpControl)
-                    }
                 } else {
                     usbAccessoryManager.send(setAppBytes)
                 }
-
-                startHeartbeat()
             }
             is WebLinkCommand.Touch -> {
                 val pt = cmd.points.firstOrNull()
@@ -742,7 +930,91 @@ class HandshakeStateMachineImpl(
             )
             delay(300)
 
-            // Stereo requests VideoOutput
+            // Step 7: App Info Exchange (Phase 6)
+            _currentStep.value = HandshakeStep.STEP_7_APP_INFO
+            delay(200)
+
+            // Stereo queries App Name
+            logRepository.log(
+                direction = LogDirection.INCOMING,
+                protocol = ProtocolType.SAC,
+                summary = "RX SAC: AppInfoRequest (Type 1: App Name for Token 1)"
+            )
+            val appNameReply = PFormatCodec.encode(SACCommand.OP_S2A_APPNINFO_RELY, SACCodec.encode(SACCommand.AppNameReply(1, "AppRadio")))
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.SAC,
+                summary = "TX SAC: AppNameReply (\"AppRadio\")",
+                rawHex = appNameReply.joinToString(" ") { String.format("%02X", it) }
+            )
+            delay(200)
+
+            // Stereo queries Package Name
+            logRepository.log(
+                direction = LogDirection.INCOMING,
+                protocol = ProtocolType.SAC,
+                summary = "RX SAC: AppInfoRequest (Type 2: Package Name for Token 1)"
+            )
+            val pkgNameReply = PFormatCodec.encode(SACCommand.OP_S2A_APPNINFO_RELY, SACCodec.encode(SACCommand.PackageNameReply(1, "jp.pioneer.mbg.appradio.AppRadioLauncher")))
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.SAC,
+                summary = "TX SAC: PackageNameReply (\"jp.pioneer.mbg.appradio.AppRadioLauncher\")",
+                rawHex = pkgNameReply.joinToString(" ") { String.format("%02X", it) }
+            )
+            delay(200)
+
+            // App Image transfer
+            logRepository.log(
+                direction = LogDirection.INCOMING,
+                protocol = ProtocolType.SAC,
+                summary = "RX SAC: AppImageRequest (Acquisition query)"
+            )
+            val iconAcqReply = PFormatCodec.encode(SACCommand.OP_S2A_APPIMAGE_TRANSFER, SACCodec.encode(SACCommand.AppImageAcquisitionReply(1, 0, DEFAULT_ICON_PNG.size)))
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.SAC,
+                summary = "TX SAC: AppImageAcquisitionReply (${DEFAULT_ICON_PNG.size} bytes)",
+                rawHex = iconAcqReply.joinToString(" ") { String.format("%02X", it) }
+            )
+            delay(200)
+
+            val iconChunk = PFormatCodec.encode(SACCommand.OP_S2A_APPIMAGE_TRANSFER, SACCodec.encode(SACCommand.AppImageChunk(1, 0, DEFAULT_ICON_PNG)))
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.SAC,
+                summary = "TX SAC: AppImageChunk (Chunk 0, ${DEFAULT_ICON_PNG.size} bytes)",
+                rawHex = iconChunk.take(32).joinToString(" ") { String.format("%02X", it) }
+            )
+            delay(200)
+
+            val iconEnd = PFormatCodec.encode(SACCommand.OP_S2A_APPIMAGE_TRANSFER, SACCodec.encode(SACCommand.AppImageEnd(1, 0)))
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.SAC,
+                summary = "TX SAC: AppImageEnd (OK)",
+                rawHex = iconEnd.joinToString(" ") { String.format("%02X", it) }
+            )
+            delay(200)
+
+            // End App Info & End App Acc
+            val endAppInfoReply = PFormatCodec.encode(SACCommand.OP_S2A_AUTH, SACCodec.encode(SACCommand.EndAppInfoReply(1)))
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.SAC,
+                summary = "TX SAC: EndAppInfoReply (status=1)",
+                rawHex = endAppInfoReply.joinToString(" ") { String.format("%02X", it) }
+            )
+            val endAppAccPacket = PFormatCodec.encode(SACCommand.OP_S2A_AUTH, SACCodec.encode(SACCommand.EndAppAcc))
+            logRepository.log(
+                direction = LogDirection.OUTGOING,
+                protocol = ProtocolType.SAC,
+                summary = "TX SAC: EndAppAcc (subtype 17)",
+                rawHex = endAppAccPacket.joinToString(" ") { String.format("%02X", it) }
+            )
+            delay(200)
+
+            // Step 8: Video Output Request & Reply (Phase 7)
             val vidReqFrame = PFormatCodec.encode(SACCommand.OP_A2S_VEDIO_OUTPUT, byteArrayOf())
             logRepository.log(
                 direction = LogDirection.INCOMING,
@@ -786,5 +1058,19 @@ class HandshakeStateMachineImpl(
                 details = touchCmd.toString()
             )
         }
+    }
+
+    companion object {
+        // Valid 1x1 RGBA PNG (67 bytes) for fast, zero-dependency icon transfer
+        val DEFAULT_ICON_PNG = byteArrayOf(
+            0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+            0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4.toByte(), 0x89.toByte(),
+            0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54,
+            0x78, 0x9C.toByte(), 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4.toByte(),
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+            0xAE.toByte(), 0x42, 0x60, 0x82.toByte()
+        )
     }
 }

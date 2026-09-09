@@ -63,6 +63,7 @@ class LiveLogViewModelTest {
         var simulated = false
 
         override fun startHandshake() { started = true }
+        override fun restartHandshake() { started = true }
         override fun reset() {}
         override fun simulateHandshake() { simulated = true }
     }

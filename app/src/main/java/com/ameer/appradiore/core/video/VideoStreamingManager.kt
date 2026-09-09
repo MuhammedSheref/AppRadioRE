@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -64,6 +65,7 @@ class VideoStreamingManagerImpl(
     private var activeRenderer: TestPatternRenderer? = null
     private var fpsCounterJob: Job? = null
     private val framesInCurrentSecond = AtomicLong(0)
+    private val isTransmittingFrame = AtomicBoolean(false)
 
     override fun startStreaming(width: Int, height: Int, fps: Int) {
         if (_isStreaming.value) return
@@ -118,6 +120,11 @@ class VideoStreamingManagerImpl(
     private fun onH264FrameEncoded(frameData: ByteArray, width: Int, height: Int) {
         if (!_isStreaming.value) return
 
+        // Drop incoming frame if previous frame write is still in flight (single-flight backpressure)
+        if (!isTransmittingFrame.compareAndSet(false, true)) {
+            return
+        }
+
         // 1. Wrap in WebLink FillRectangleCommand (ID 1)
         val fillRectangle = WebLinkCommand.FillRectangle(
             width = width,
@@ -137,13 +144,27 @@ class VideoStreamingManagerImpl(
 
         // 3. Transmit via UsbAccessoryManager
         scope.launch {
-            usbAccessoryManager.send(mtpBytes)
+            try {
+                if (_isStreaming.value) {
+                    val success = usbAccessoryManager.send(mtpBytes)
+                    if (success) {
+                        _framesSent.value++
+                        _bytesSent.value += mtpBytes.size
+                        framesInCurrentSecond.incrementAndGet()
+                    } else {
+                        logRepository.log(
+                            direction = LogDirection.INTERNAL,
+                            protocol = ProtocolType.SYSTEM,
+                            summary = "USB write failed during video streaming; stopping stream",
+                            isError = true
+                        )
+                        stopStreaming()
+                    }
+                }
+            } finally {
+                isTransmittingFrame.set(false)
+            }
         }
-
-        // 4. Update stats
-        _framesSent.value++
-        _bytesSent.value += mtpBytes.size
-        framesInCurrentSecond.incrementAndGet()
     }
 
     private fun startFpsCounter() {
@@ -161,6 +182,7 @@ class VideoStreamingManagerImpl(
         if (!_isStreaming.value && activeEncoder == null) return
 
         _isStreaming.value = false
+        isTransmittingFrame.set(false)
         fpsCounterJob?.cancel()
         fpsCounterJob = null
         _fps.value = 0
