@@ -137,7 +137,7 @@ class HandshakeStateMachineImpl(
                 _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
             }
 
-            // Retry loop matching Pioneer's AccessoryAuthor: up to 5 attempts, 2500ms apart
+            // Retry loop matching Pioneer's AccessoryAuthor (AUTH_INTERVAL = 3000ms): up to 5 attempts
             var attempt = 1
             while (isActive && attempt <= 5 && !isSacAuthenticated) {
                 logRepository.log(
@@ -145,17 +145,9 @@ class HandshakeStateMachineImpl(
                     protocol = ProtocolType.SYSTEM,
                     summary = "Sending AuthBegin (Attempt $attempt of 5)..."
                 )
-                // If retrying, re-send MTP Connection ACK for Port 12347 to ensure socket state is synced
-                if (attempt > 1 && isMtpMode) {
-                    val ack = MTPCodec.createConnectionAck(
-                        srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, stereoAddress.ip, MTPPacket.PORT_CONTROL_CHANNEL),
-                        dstAddress = stereoAddress
-                    )
-                    usbAccessoryManager.send(ack)
-                }
                 sendSacCommand(SACCommand.AuthBegin)
                 attempt++
-                delay(2500L)
+                delay(3000L)
             }
 
             if (!isSacAuthenticated && _currentStep.value != HandshakeStep.CONNECTED_READY) {
@@ -653,7 +645,8 @@ class HandshakeStateMachineImpl(
                 val h = cmd.clientHeight.takeIf { it > 0 } ?: cmd.sourceHeight
                 _stereoSpecs.value = _stereoSpecs.value.copy(
                     width = w,
-                    height = h
+                    height = h,
+                    isReadyForVideo = true
                 )
 
                 // NOTE: Do NOT cancel authJob! WebLink (Port 12346) and SAC (Port 12347) are concurrent channels.

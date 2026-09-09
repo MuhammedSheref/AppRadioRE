@@ -1016,13 +1016,13 @@ Step 4: Jetpack Compose Diagnostic UI
    - Live streaming badges: `FPS`, `Frames`, `Sent MB`.
 
 ### 25.3 Test Coverage & Verification
-- **Automated Tests**: 51 of 51 unit tests passing across all layers (`./gradlew testDebugUnitTest`):
+- **Automated Tests**: 52 of 52 unit tests passing across all layers (`./gradlew testDebugUnitTest`):
   - `MTPCodecTest`: Verifies MTP packet framing (`0x1E ... 0x03`), IPv4 address parsing, port multiplexing, and connection ACKs (`isLast = false`).
   - `SACCodecTest`: Validates SAC command encoding/decoding, including `RequestPhoneStatus` (Opcode 0x62) and `SmartPhoneStatus` (Opcode 0x63).
   - `WebLinkCodecTest`: 1-byte `SetFps`, length-prefixed `SetCurrentApp`, and `FillRectangle` round-trips.
   - `HandshakeStateMachineTest`: Simulates full AAM2 Port 12347 SYN, 1000ms pause, AuthBegin retry loop, spec exchange, and auto-unlock.
   - `VideoStreamingManagerTest`: Lifecycle, H.264 frame packaging, and MTP Port 12346 wire wrapping.
-  - `LiveLogViewModelTest`: Video streaming actions, auto-start on `CONNECTED_READY`, and state observers.
+  - `LiveLogViewModelTest`: Video streaming actions, auto-start upon `isReadyForVideo` / `CONNECTED_READY`, search queries, protocol filters, and video stream toggling via Turbine.
 - **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` built and verified for physical hardware deployment.
 
 ### 25.4 Phase 2.5: In-Car Verification on Pioneer AVH-Z2090BT & Protocol Synchronization (COMPLETED)
@@ -1037,11 +1037,12 @@ Step 4: Jetpack Compose Diagnostic UI
    - **Decompiled Source Architecture**:
      - `ProtocolDispatcherImpl.java:L1073-L1085`: Stereo sends SYN on Port 12347 $\rightarrow$ Phone writes 0-byte ACK $\rightarrow$ calls `notifyControlChannelReady()`.
      - `ExtBaseService.java:L2366-L2418`: `onControlChannelReady()` transitions state to `STATE_CONNECTING` and invokes `handleConnecting()`, which sets a **1000ms delay** via `postDelayed(..., 1000L)` before calling `onRemoteAuthBegin()`.
-     - `AccessoryAuthor.java:L25-L105`: Transmits `AuthBegin` with a 2500ms timeout, retrying up to 5 times.
+     - `AccessoryAuthor.java:L25-L105`: Transmits `AuthBegin` with a 3000ms timeout (`AUTH_INTERVAL = 3000`), retrying up to 5 times without injecting redundant MTP connection ACKs.
    - **Implementation**:
      - Removed premature `scheduleAuthSequence(1000L)` from `startHandshake()`.
      - App awaits Port 12347 SYN, responds with an MTP Connection ACK, and waits 1000ms before sending `AuthBegin`.
      - Debounced duplicate SYN packets (`authJob?.isActive != true`), matching `ProtocolDispatcherImpl`.
+     - Aligned retry loop with `AccessoryAuthor`: 3000ms interval, removed duplicate SYN/ACK packets.
      - Added a 4000ms fallback timer to preserve support for non-MTP direct USB Pioneer stereos.
 
 3. **MTP Connection Acknowledgment Wire Rules**:
@@ -1055,12 +1056,28 @@ Step 4: Jetpack Compose Diagnostic UI
      - Phone must reply with Opcode 0x63 (`OP_S2A_SMARTPHONE_STATUS`).
    - **Implementation**: Added `SACCommand.RequestPhoneStatus` and `SACCommand.SmartPhoneStatus(statusType = 0x20)`. When the stereo queries phone status, `HandshakeStateMachine` immediately replies with Opcode 0x63, allowing the stereo to finalize setup.
 
-5. **Video Channel Decoupling & Fully Automatic Mirroring**:
-   - Decoupled WebLink `VideoConfig` (Port 12346) from SAC handshake completion. Handshake transition to `CONNECTED_READY` occurs only upon full SAC completion (`EndAppAccReply` or `VideoOutputRequest`).
-   - Video streaming initiates automatically via `LiveLogViewModel` when `CONNECTED_READY` is reached, removing any need for manual button intervention.
-   - In `LiveLogScreen.kt`, replaced the offline mock demo button icon with `BugReport` to prevent user confusion with hardware playback.
+5. **Elimination of Dual-Channel Authentication Deadlock (`WLServerConnection.java`)**:
+   - **Deadlock Discovery**: In physical testing, the handshake would stall at `AuthBegin`. However, if the user manually started video streaming, the stereo immediately replied with `AuthResponse (result = 8)`!
+   - **Root Cause**: On AppRadio Mode+ head units, the video decoder subsystem on Port 12346 operates in lockstep with the control subsystem on Port 12347. The stereo will **not** dispatch `AuthResponse` until it detects active H.264 video frames (`FillRectangle`) arriving on Port 12346. Waiting for `CONNECTED_READY` (which requires `AuthResponse`) before starting video caused a complete circular deadlock.
+   - **Decompiled Source Proof**:
+     `WLServerConnection.java:L266-L322`:
+     ```java
+     this.m_connection.sendCommand(new VideoConfigCommand(...));
+     onVideoConfigurationCompleted();
+     ...
+     protected void onVideoConfigurationCompleted() {
+         this.m_encodingThread = new EncodingSurfaceThread();
+         this.m_encodingThread.start();
+         startCapture();
+     }
+     ```
+     Pioneer starts video capture and transmission **immediately** upon `VideoConfig` confirmation!
+   - **Implementation**:
+     - In `HandshakeStateMachine.kt`, upon receiving `WebLinkCommand.VideoConfig`, `_stereoSpecs.value` is updated with `isReadyForVideo = true`.
+     - In `LiveLogViewModel.kt`, observing `stereoSpecs` immediately starts `videoStreamingManager.startStreaming()` as soon as `isReadyForVideo` becomes true.
+     - Live H.264 frames flow down Port 12346, instantly unlocking the stereo video hardware and causing the head unit to release `AuthResponse (result = 8)` without any user intervention.
 
 ---
 
-> **Document Status**: Live, updated with Phase 2.5 Pioneer AVH-Z2090BT hardware integration, Port 12347 Control Channel synchronization, and Opcode 0x62/0x63 status reply. All 51 tests passing. Ready for in-vehicle video verification.
+> **Document Status**: Live, updated with Phase 2.5 Pioneer AVH-Z2090BT hardware integration, dual-channel auth deadlock resolution via `WLServerConnection.onVideoConfigurationCompleted()`, and 52 passing unit tests. Ready for in-vehicle testing.
 

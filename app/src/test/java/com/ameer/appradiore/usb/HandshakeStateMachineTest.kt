@@ -187,6 +187,7 @@ class HandshakeStateMachineTest {
         assertEquals(800, stateMachine.stereoSpecs.value.width)
         assertEquals(480, stateMachine.stereoSpecs.value.height)
         assertEquals(240, stateMachine.stereoSpecs.value.dpi)
+        assertTrue(stateMachine.stereoSpecs.value.isReadyForVideo)
 
         stateMachine.reset()
     }

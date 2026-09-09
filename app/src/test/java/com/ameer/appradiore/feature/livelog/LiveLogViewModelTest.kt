@@ -231,4 +231,16 @@ class LiveLogViewModelTest {
         assertTrue(fakeVideoStreamingManager.streamingStopped)
         assertFalse(viewModel.state.value.isStreaming)
     }
+
+    @Test
+    fun testVideoStreamingStartsAutomaticallyOnVideoConfigReady() = runTest {
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
+
+        assertFalse(fakeVideoStreamingManager.streamingStarted)
+
+        fakeStateMachine.stereoSpecs.value = StereoSpecs(width = 800, height = 480, isReadyForVideo = true)
+
+        assertTrue(fakeVideoStreamingManager.streamingStarted)
+        assertTrue(viewModel.state.value.isStreaming)
+    }
 }

@@ -84,13 +84,22 @@ sequenceDiagram
 
 ## 3. Step-by-Step Breakdown
 
-### Step 0: Transport Sync (Port 12347 Control Channel)
-- **Action**: Stereo transmits an MTP connection SYN packet (empty payload) to establish the Control Channel (Port 12347).
-- **Phone Response**: Phone immediately replies with an MTP Connection ACK (`isLast = false`).
+### Step 0: Transport Sync (Port 12347 Control Channel & Port 12346 Video Channel)
+- **Action**: Stereo transmits an MTP connection SYN packet (empty payload) to establish the Control Channel (Port 12347) and concurrently connects the Video Channel (Port 12346).
+- **Phone Response**: Phone immediately replies with an MTP Connection ACK (`isLast = false`) for each channel.
 - **Timing Constraint**: Following Pioneer's `ExtBaseService.handleConnecting()`, the phone initiates a **1000ms pause** before transmitting `AuthBegin`. Transmitting packets earlier results in dropped frames because the stereo's listener daemon has not yet finished attaching to the port.
 
+### Step 0.5: WebLink VideoConfig & Dual-Channel Synchronization (Deadlock Resolution)
+- **Stereo Negotiation**: On AppRadio Mode+ head units (such as the Pioneer AVH-Z2090BT), the stereo immediately transmits WebLink `SyncSessionTime` (ID 73) and `VideoConfig` (ID 32) on Port 12346.
+- **Phone Confirmation**: Phone echoes `SyncSessionTime` and replies with `VideoConfig Confirm` (`800x480 H.264 @ 8 Mbps`).
+- **Immediate Streaming (`WLServerConnection.onVideoConfigurationCompleted`)**:
+  - In Pioneer's official architecture, `onVideoConfigurationCompleted()` immediately starts the encoder thread and calls `startCapture()`.
+  - On the AVH-Z2090BT, the head unit's video decoder hardware on Port 12346 must receive initial H.264 video frames (`FillRectangle`) before the stereo's control subsystem on Port 12347 releases `AuthResponse (result = 8)`.
+  - **Resolution**: Video streaming is triggered immediately upon `VideoConfig` confirmation (`isReadyForVideo = true`). Transmitting video frames satisfies the head unit decoder and unblocks SAC authentication.
+
 ### Step 1: Authentication
-- **Action**: Phone sends `SACCommand.AuthBegin`.
+- **Action**: Phone sends `SACCommand.AuthBegin` on Port 12347.
+- **Retry Mechanism**: If no immediate response, retries up to 5 times at 3000ms intervals matching Pioneer's `AccessoryAuthor.java`. Redundant MTP Connection ACKs are NOT re-sent during retries.
 - **Expected Reply**: Stereo responds with `SACCommand.AuthResponse` containing `result = 0` (or `8` for AAM2) and version `3.1`.
 - **Completion**: Phone sends `SACCommand.AuthEnd(isSuccess = true, majorVersion = 3, minorVersion = 1)`.
 
