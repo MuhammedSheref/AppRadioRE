@@ -18,10 +18,17 @@ sequenceDiagram
 
     Note over Phone,Stereo: USB Cable Connected (AOA Mode Established)
     
+    rect rgb(25, 35, 50)
+        Note over Phone,Stereo: Phase 0: Transport Sync (Port 12347 Control Channel)
+        Stereo->>Phone: MTP [Port 12347] Connection SYN (Empty Payload)
+        Phone->>Stereo: MTP [Port 12347] Connection ACK (isLast=false)
+        Note over Phone: Wait 1000ms delay (ExtBaseService.handleConnecting)
+    end
+
     rect rgb(30, 45, 60)
         Note over Phone,Stereo: Phase 1: Authentication
         Phone->>Stereo: PFormat [Opcode 0x00] AuthBegin (0x00)
-        Stereo->>Phone: PFormat [Opcode 0x00] AuthResponse (result=0x00, v3.1)
+        Stereo->>Phone: PFormat [Opcode 0x00] AuthResponse (result=0x00 / 0x08, v3.1)
         Phone->>Stereo: PFormat [Opcode 0x00] AuthEnd (success=1, v3.1)
     end
 
@@ -49,15 +56,22 @@ sequenceDiagram
         Stereo->>Phone: PFormat [Opcode 0x00] EndAccessoryInfoReply (status=1)
     end
 
+    rect rgb(50, 40, 60)
+        Note over Phone,Stereo: Phase 4: Smartphone Status Exchange (AppRadio Mode+)
+        Stereo->>Phone: PFormat [Opcode 0x62] RequestPhoneStatus [0x20]
+        Phone->>Stereo: PFormat [Opcode 0x63] SmartPhoneStatus [0x20, 0x00]
+    end
+
     rect rgb(60, 45, 30)
-        Note over Phone,Stereo: Phase 4: Video Output Activation & Standby
+        Note over Phone,Stereo: Phase 5: Video Output Activation & Automatic Streaming
         Stereo->>Phone: PFormat [Opcode 0x06] VideoOutputRequest
         Phone->>Stereo: PFormat [Opcode 0x06] VideoOutputReply [0x06, 0x01]
         Note over Stereo: Display Switch: Pioneer unlocks AppRadio mode!
+        Note over Phone: State -> CONNECTED_READY: Auto-launches H.264 Video Streaming (Port 12346)
     end
 
     rect rgb(40, 40, 40)
-        Note over Phone,Stereo: Phase 5: Normal Operation & Heartbeat
+        Note over Phone,Stereo: Phase 6: Normal Operation & Heartbeat
         loop Every 5 seconds
             Phone->>Stereo: PFormat [Opcode 0x20] RequestAccessoryStatus (Heartbeat)
             Stereo->>Phone: PFormat [Opcode 0x02] AccessoryStatus
@@ -70,56 +84,65 @@ sequenceDiagram
 
 ## 3. Step-by-Step Breakdown
 
-### Step 0: Authentication
-- **Action**: Phone sends `SACCommand.AuthBegin`.
-- **Expected Reply**: Stereo responds with `SACCommand.AuthResponse` containing `result = 0` and version `3.1`.
-- **Completion**: Phone sends `SACCommand.AuthEnd(isSuccess = true, majorVersion = 3, minorVersion = 1)`.
-- **Note**: The legacy APK attempted to calculate an MD5 salt `"PionnerKit"`, but the head unit firmware accepts standard version `3.1` auth directly without crypto negotiation.
+### Step 0: Transport Sync (Port 12347 Control Channel)
+- **Action**: Stereo transmits an MTP connection SYN packet (empty payload) to establish the Control Channel (Port 12347).
+- **Phone Response**: Phone immediately replies with an MTP Connection ACK (`isLast = false`).
+- **Timing Constraint**: Following Pioneer's `ExtBaseService.handleConnecting()`, the phone initiates a **1000ms pause** before transmitting `AuthBegin`. Transmitting packets earlier results in dropped frames because the stereo's listener daemon has not yet finished attaching to the port.
 
-### Step 1: Kind 4 (Start App Accessory)
+### Step 1: Authentication
+- **Action**: Phone sends `SACCommand.AuthBegin`.
+- **Expected Reply**: Stereo responds with `SACCommand.AuthResponse` containing `result = 0` (or `8` for AAM2) and version `3.1`.
+- **Completion**: Phone sends `SACCommand.AuthEnd(isSuccess = true, majorVersion = 3, minorVersion = 1)`.
+
+### Step 2: Kind 4 (Start App Accessory)
 - **Action**: Phone sends `SACCommand.StartAppAcc` (`0x10`).
 - **Expected Reply**: `SACCommand.StartAppAccReply` (`status = 1`).
 
-### Step 2: Kind 5 (Start Accessory Info)
+### Step 3: Kind 5 (Start Accessory Info)
 - **Action**: Phone sends `SACCommand.StartAccessoryInfo` (`0x14`).
 - **Expected Reply**: `SACCommand.StartAccessoryInfoReply` (`status = 1`).
 - **Purpose**: Signals to the stereo that product capability inquiry is commencing.
 
-### Step 3: Kind 2 (Request Product Spec Info)
+### Step 4: Kind 2 (Request Product Spec Info)
 - **Action**: Phone sends `SACCommand.RequestSpecInfo` (Opcode `0x01`, subtype `0x01`).
 - **Expected Reply**: `SACCommand.ProductSpecInfo`.
 - **Information Extracted**:
-  - `modelId`: Pioneer head unit model number (e.g. `0x0112` for SPH-DA120).
+  - `modelId`: Pioneer head unit model number (e.g. `0x0112` for SPH-DA120, `0x1013` for AVH-Z2090BT).
   - `pointerCount`: Number of multi-touch points supported by the hardware digitizer (e.g. 2).
   - `hasGps`: Whether car has an external roof-mounted GPS antenna connected.
   - `hasRemoteControl`: Steering wheel buttons / remote controller capability.
 
-### Step 4: Kind 1 (Request Display Info)
+### Step 5: Kind 1 (Request Display Info)
 - **Action**: Phone sends `SACCommand.RequestDisplayInfo` (Opcode `0x01`, subtype `0x00`).
 - **Expected Reply**: `SACCommand.DisplaySpecInfo`.
 - **Information Extracted**:
   - `width`: Native screen width (e.g. `800`).
   - `height`: Native screen height (e.g. `480`).
-  - *This resolution is passed directly to the `VirtualDisplay` and `MediaCodec` video encoder in Phase 2.*
+  - *This resolution is passed directly to the `VirtualDisplay` and `MediaCodec` video encoder.*
 
-### Step 5: Kind 3 (Request Accessory Status)
+### Step 6: Kind 3 (Request Accessory Status)
 - **Action**: Phone sends `SACCommand.RequestAccessoryStatus` (Opcode `0x20`, subtype `0x20`, `0xFF`).
 - **Expected Reply**: `SACCommand.AccessoryStatus`.
 - **Information Extracted**:
   - `isParkingBrakeOn`: Pioneer head units restrict video/app access if the parking brake is disengaged. Knowing this status enables the app to display a safety reminder banner.
   - `isHdmiConnected`: Cable connection type.
 
-### Step 6: Kind 6 (End Accessory Info)
+### Step 7: Kind 6 (End Accessory Info)
 - **Action**: Phone sends `SACCommand.EndAccessoryInfo` (`0x15`).
 - **Expected Reply**: `SACCommand.EndAccessoryInfoReply` (`status = 1`).
 - **Purpose**: Concludes capability exchange.
 
-### Step 7: Video Output Activation & Standby
-- **Stereo Trigger**: Once Step 6 acknowledges, the stereo sends `SACCommand.VideoOutputRequest` (Opcode `0x06`).
-- **Phone Response**: Phone immediately responds with `SACCommand.VideoOutputReply` (Opcode `0x06`, subtype `0x06`, status `0x01`) $\rightarrow$ wire bytes `[0x06, 0x01]`.
-- **Result**: Pioneer head unit switches its internal video multiplexer to the external video input. The stereo screen is now unlocked and awaiting video frames.
+### Step 8: Smartphone Status Exchange (AppRadio Mode+ / Opcode 0x62 & 0x63)
+- **Stereo Query**: On newer head units such as the **AVH-Z2090BT**, the stereo issues `RequestPhoneStatus` (Opcode `0x62`, payload `[0x20]`).
+- **Phone Response**: Phone immediately responds with `SmartPhoneStatus` (Opcode `0x63`, payload `[0x20, 0x00]`).
+- *Critical*: Omission of this reply causes the head unit to remain in an indefinite "Loading..." screen.
 
-### Step 8: Heartbeat & Event Loop
+### Step 9: Video Output Activation & Automatic Mirroring
+- **Stereo Trigger**: The stereo sends `SACCommand.VideoOutputRequest` (Opcode `0x06`).
+- **Phone Response**: Phone immediately responds with `SACCommand.VideoOutputReply` (Opcode `0x06`, subtype `0x06`, status `0x01`) $\rightarrow$ wire bytes `[0x06, 0x01]`.
+- **Automatic Execution**: State transitions to `CONNECTED_READY`, and the app immediately launches hardware H.264 video streaming over MTP Port 12346 without requiring manual user input.
+
+### Step 10: Heartbeat & Event Loop
 - **Heartbeat**: To keep the session alive and monitor real-time vehicle status changes (e.g. parking brake engagement), the phone transmits `SACCommand.RequestAccessoryStatus` every 5 seconds.
 - **Touch Interaction**: As the user interacts with the stereo touchscreen, the head unit sends `WebLinkCommand.Touch` packets containing pointer IDs, state, and `(x, y)` coordinates mapped directly to the stereo display resolution.
 

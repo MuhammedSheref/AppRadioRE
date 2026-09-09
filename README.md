@@ -5,16 +5,16 @@
 [![Android](https://img.shields.io/badge/Platform-Android_8.0+_(API_26+)-green.svg?style=flat&logo=android)](https://www.android.com)
 [![Compose](https://img.shields.io/badge/UI-Jetpack_Compose_Material3-blue.svg?style=flat&logo=jetpackcompose)](https://developer.android.com/jetpack/compose)
 [![Architecture](https://img.shields.io/badge/Architecture-Clean%20%2F%20MVI-orange.svg?style=flat)](#architecture)
-[![Unit Tests](https://img.shields.io/badge/Tests-46%20Passing-brightgreen.svg?style=flat)](#testing)
+[![Unit Tests](https://img.shields.io/badge/Tests-51%20Passing-brightgreen.svg?style=flat)](#testing)
 [![License](https://img.shields.io/badge/License-MIT-lightgrey.svg?style=flat)](LICENSE)
 
-A modern, high-performance Android mirroring engine and live protocol diagnostic tool for **Pioneer AppRadio Mode 2 (AAM2 / WebLink)** car stereos (including the Pioneer SPH-DA120, AVH-X8*** series, and Carrozzeria units).
+A modern, high-performance Android mirroring engine and live protocol diagnostic tool for **Pioneer AppRadio Mode 2 & AppRadio Mode+ (AAM2 / WebLink)** car stereos (including the Pioneer SPH-DA120, AVH-Z**** series such as the **AVH-Z2090BT**, AVH-X8*** series, and Carrozzeria units).
 
 ---
 
 ## 🚗 Background & Motivation
 
-In 2014, Pioneer introduced **AppRadio Mode 2 (AAM2)**, a protocol utilizing USB Android Open Accessory (AOA) to stream video and relay touchscreen digitizer events between an Android smartphone and a vehicle dashboard head unit.
+In 2014, Pioneer introduced **AppRadio Mode 2 (AAM2)**, followed by **AppRadio Mode+**, protocols utilizing USB Android Open Accessory (AOA) to stream video and relay touchscreen digitizer events between an Android smartphone and a vehicle dashboard head unit.
 
 The original Pioneer companion application was abandoned years ago:
 - Spanned **4 separate background processes** with complex AIDL inter-process communication.
@@ -28,13 +28,17 @@ The original Pioneer companion application was abandoned years ago:
 
 ## ✨ Features
 
-- **⚡ Instant Handshake Negotiation**:
-  - Connects to the Pioneer stereo in ~300ms over physical USB AOA.
-  - Automatically acknowledges Video Channel (Port 12346) and Control Channel (Port 12347).
+- **⚡ Instant Handshake Negotiation (1-to-1 Decompiled Match)**:
+  - Connects to Pioneer stereos over physical USB AOA matching Pioneer's internal `ProtocolDispatcherImpl` and `ExtBaseService` state machine.
+  - Automatically acknowledges Video Channel (Port 12346) and Control Channel (Port 12347) with compliant MTP frames (`isLast = false`).
+  - Waits the official 1000ms delay after Port 12347 establishment before transmitting `AuthBegin`, eliminating premature packet drops.
+  - Debounces duplicate SYN packets without stalling authentication.
+  - Includes AppRadio Mode+ status support: immediately answers `RequestPhoneStatus` (Opcode 0x62) with `SmartPhoneStatus` (Opcode 0x63), preventing head unit "Loading..." freezes.
   - Synchronizes session timestamps and confirms video parameters (`800x480 @ 240 DPI, H.264 @ 8 Mbps`).
-  - Automatically sends `SetCurrentAppCommand("wlhome_1.0://")` to trigger the stereo's mirroring mode.
+  - Automatically sends `SetCurrentAppCommand("wlhome_1.0://")` and transitions straight to video streaming.
 
-- **🎥 Hardware H.264 Video Pipeline**:
+- **🎥 Hardware H.264 Video Pipeline & Auto-Streaming**:
+  - Automatically launches video mirroring upon handshake completion (`CONNECTED_READY`).
   - Direct hardware encoding via `MediaCodec` (`video/avc`) at `800x480 @ 30 FPS` and `8 Mbps`.
   - Zero-copy surface rendering loop using `COLOR_FormatSurface`.
   - Built-in 30 FPS automotive test pattern renderer with real-time millisecond clock (`HH:mm:ss.SSS`), monospaced frame counter, corner calibration crosshairs, and animated bouncing orb for visual confirmation of smooth 30 FPS streaming.
@@ -111,7 +115,7 @@ AppRadioRE/
 │   │   ├── di/                   # Layered Koin DI modules (Logging, USB, Video, Feature)
 │   │   ├── feature/livelog/      # Jetpack Compose UI (Cards, ControlBar, Inspection Dialog)
 │   │   └── ui/theme/             # Automotive dark tech theme
-│   └── src/test/java/            # Comprehensive unit test suite (46 tests)
+│   └── src/test/java/            # Comprehensive unit test suite (51 tests)
 ├── agend.md                      # Detailed technical specification and reverse-engineering notes
 └── README.md
 ```
@@ -147,37 +151,38 @@ app/build/outputs/apk/debug/app-debug.apk
 
 ---
 
-## 📱 In-Car Hardware Testing
+## 📱 In-Car Hardware Testing (Pioneer AVH-Z2090BT & AAM2)
 
-1. **Install the APK** on your Android smartphone.
-2. **Connect the phone** to your Pioneer car stereo via a USB cable.
-3. **Automatic Connection**:
-   - The head unit detects the AOA accessory (`jp.pioneer.ce.aam2.linkwith`).
+1. **Install the APK** (`app-debug.apk`) on your Android phone.
+2. **Reset Head Unit State**:
+   - Disconnect USB.
+   - On your Pioneer stereo (e.g., AVH-Z2090BT), press the physical **HOME** button to ensure it is on the primary home screen, clearing any lingering video sessions.
+3. **Connect via USB**:
+   - Plug the USB cable into the phone and car USB port.
    - Grant USB accessory permission when prompted.
-   - The handshake will complete in ~300ms, displaying:
-     `CONNECTED_READY: 800x480 @ 240 DPI, Touch: 2 pts, Brake: ON`.
-   - The car stereo will switch or highlight its Mirroring / AppRadio Mode screen.
-4. **Stream Test Pattern**:
-   - Tap **STREAM VIDEO** on the phone.
-   - The stereo screen will render the real-time 30 FPS animated automotive dashboard (with ticking clock, frame counter, and animated graphics).
-   - Tap **STOP** to halt the video pipeline cleanly.
+   - **No manual button presses needed**: The app will automatically acknowledge Port 12347, pause 1000ms, authenticate, reply to Opcode 0x62 status queries, and transition directly to `CONNECTED_READY`.
+4. **Automatic Video Mirroring**:
+   - Video streaming begins automatically upon handshake completion.
+   - The head unit display will render the real-time 30 FPS animated automotive dashboard (with real-time clock, frame counter, and animated graphics).
+   - If desired, the video stream can be paused or resumed from the phone UI.
 
 ---
 
 ## 🧪 Testing
 
-All unit tests run locally without requiring a connected car stereo:
+All 51 unit tests run locally in hermetic environments without requiring a physical car stereo:
 
 ```bash
 ./gradlew testDebugUnitTest
 ```
 
 ### Test Coverage Highlights:
+- **`SACCodecTest`**: Tests encoding and decoding of SAC commands, including `RequestPhoneStatus` (Opcode 0x62) and `SmartPhoneStatus` (Opcode 0x63).
+- **`MTPCodecTest`**: Verifies MTP packet framing (`0x1E ... 0x03`), IPv4 address parsing, port multiplexing, and connection ACKs (`isLast = false`).
 - **`WebLinkCodecTest`**: Validates Little-Endian round-trips for `SetFps`, length-prefixed `SetCurrentApp`, `VideoConfig`, `DisplayMetrics`, and `FillRectangle`.
-- **`MTPCodecTest`**: Verifies MTP packet framing (`0x1E ... 0x03`), IPv4 address parsing, port multiplexing, and connection ACKs.
-- **`HandshakeStateMachineTest`**: Simulates the full Pioneer authentication sequence and verifies automatic screen unlocking.
+- **`HandshakeStateMachineTest`**: Simulates the full Pioneer AAM2 lifecycle (Port 12347 SYN, 1000ms delay, AuthBegin retry loop, spec exchange, and auto-unlock).
 - **`VideoStreamingManagerTest`**: Verifies encoder lifecycle, H.264 frame packaging into `FillRectangleCommand`, and MTP Port 12346 wire wrapping.
-- **`LiveLogViewModelTest`**: Tests MVI state updates, search queries, protocol filters, and video stream toggling via Turbine.
+- **`LiveLogViewModelTest`**: Tests MVI state updates, auto-start on `CONNECTED_READY`, search queries, protocol filters, and video stream toggling via Turbine.
 
 ---
 

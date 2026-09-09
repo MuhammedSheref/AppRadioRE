@@ -1016,12 +1016,51 @@ Step 4: Jetpack Compose Diagnostic UI
    - Live streaming badges: `FPS`, `Frames`, `Sent MB`.
 
 ### 25.3 Test Coverage & Verification
-- **Automated Tests**: 46 of 46 unit tests passing across all layers (`./gradlew testDebugUnitTest`):
+- **Automated Tests**: 51 of 51 unit tests passing across all layers (`./gradlew testDebugUnitTest`):
+  - `MTPCodecTest`: Verifies MTP packet framing (`0x1E ... 0x03`), IPv4 address parsing, port multiplexing, and connection ACKs (`isLast = false`).
+  - `SACCodecTest`: Validates SAC command encoding/decoding, including `RequestPhoneStatus` (Opcode 0x62) and `SmartPhoneStatus` (Opcode 0x63).
   - `WebLinkCodecTest`: 1-byte `SetFps`, length-prefixed `SetCurrentApp`, and `FillRectangle` round-trips.
+  - `HandshakeStateMachineTest`: Simulates full AAM2 Port 12347 SYN, 1000ms pause, AuthBegin retry loop, spec exchange, and auto-unlock.
   - `VideoStreamingManagerTest`: Lifecycle, H.264 frame packaging, and MTP Port 12346 wire wrapping.
-  - `LiveLogViewModelTest`: Video streaming actions and state observers.
-- **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` built and ready for physical hardware verification.
+  - `LiveLogViewModelTest`: Video streaming actions, auto-start on `CONNECTED_READY`, and state observers.
+- **Compiled APK**: `app/build/outputs/apk/debug/app-debug.apk` built and verified for physical hardware deployment.
+
+### 25.4 Phase 2.5: In-Car Verification on Pioneer AVH-Z2090BT & Protocol Synchronization (COMPLETED)
+
+1. **Target Head Unit Hardware Profile**:
+   - Model: **Pioneer AVH-Z2090BT** (Model ID `0x1013`, AppRadio Mode+).
+   - Touch digitizer: 2 multi-touch pointers.
+   - Screen specs: 800 x 480 @ 240 DPI, H.264 hardware decode at 8 Mbps.
+
+2. **Control Channel & `AuthBegin` Synchronization**:
+   - **Root Cause**: Previously, our app transmitted `AuthBegin` immediately upon USB accessory attachment. On the AVH-Z2090BT, the stereo initiates connection on Port 12347 (MTP Control Channel) via an empty SYN packet. Premature transmission resulted in dropped frames and authentication stalls.
+   - **Decompiled Source Architecture**:
+     - `ProtocolDispatcherImpl.java:L1073-L1085`: Stereo sends SYN on Port 12347 $\rightarrow$ Phone writes 0-byte ACK $\rightarrow$ calls `notifyControlChannelReady()`.
+     - `ExtBaseService.java:L2366-L2418`: `onControlChannelReady()` transitions state to `STATE_CONNECTING` and invokes `handleConnecting()`, which sets a **1000ms delay** via `postDelayed(..., 1000L)` before calling `onRemoteAuthBegin()`.
+     - `AccessoryAuthor.java:L25-L105`: Transmits `AuthBegin` with a 2500ms timeout, retrying up to 5 times.
+   - **Implementation**:
+     - Removed premature `scheduleAuthSequence(1000L)` from `startHandshake()`.
+     - App awaits Port 12347 SYN, responds with an MTP Connection ACK, and waits 1000ms before sending `AuthBegin`.
+     - Debounced duplicate SYN packets (`authJob?.isActive != true`), matching `ProtocolDispatcherImpl`.
+     - Added a 4000ms fallback timer to preserve support for non-MTP direct USB Pioneer stereos.
+
+3. **MTP Connection Acknowledgment Wire Rules**:
+   - MTP Connection ACK packets must be encoded with `isLast = false`.
+   - In MTP framing, an empty payload packet with `isLast = true` signals `SendCloseMtpMessage` (socket teardown). Setting `isLast = false` ensures the stereo keeps the TCP socket connection open.
+
+4. **Resolution of Head Unit "Loading..." Screen (Opcode 0x62 & Opcode 0x63)**:
+   - **Issue**: In physical testing on the AVH-Z2090BT, after successfully exchanging specs, the stereo remained stuck on its "Loading..." screen while sending repeated requests with Opcode 0x62 (`[0x20]`).
+   - **Protocol Finding**:
+     - Opcode 0x62 (`OP_A2S_REQUEST_PHONE_STATUS`) is issued by AppRadio Mode+ units to query phone battery, call, and VR status.
+     - Phone must reply with Opcode 0x63 (`OP_S2A_SMARTPHONE_STATUS`).
+   - **Implementation**: Added `SACCommand.RequestPhoneStatus` and `SACCommand.SmartPhoneStatus(statusType = 0x20)`. When the stereo queries phone status, `HandshakeStateMachine` immediately replies with Opcode 0x63, allowing the stereo to finalize setup.
+
+5. **Video Channel Decoupling & Fully Automatic Mirroring**:
+   - Decoupled WebLink `VideoConfig` (Port 12346) from SAC handshake completion. Handshake transition to `CONNECTED_READY` occurs only upon full SAC completion (`EndAppAccReply` or `VideoOutputRequest`).
+   - Video streaming initiates automatically via `LiveLogViewModel` when `CONNECTED_READY` is reached, removing any need for manual button intervention.
+   - In `LiveLogScreen.kt`, replaced the offline mock demo button icon with `BugReport` to prevent user confusion with hardware playback.
 
 ---
 
-> **Document Status**: Live, updated with Phase 2 Video Pipeline, MediaCodec Surface encoder, and 30 FPS Test Pattern streaming. Ready for in-car hardware display testing.
+> **Document Status**: Live, updated with Phase 2.5 Pioneer AVH-Z2090BT hardware integration, Port 12347 Control Channel synchronization, and Opcode 0x62/0x63 status reply. All 51 tests passing. Ready for in-vehicle video verification.
+

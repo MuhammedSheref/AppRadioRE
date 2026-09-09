@@ -49,6 +49,8 @@ The SAC layer defines application-level control messages. All multibyte integers
 | **Stereo $\rightarrow$ Phone** | `0x04` | `OP_A2S_APPIMAGE_TRANSFER_REQUEST` | Head unit requests app icons for menu display |
 | **Phone $\rightarrow$ Stereo** | `0x04` | `OP_S2A_APPIMAGE_TRANSFER` | Phone streams icon bitmap chunks (512B max) |
 | **Stereo $\rightarrow$ Phone** | `0x05` | `OP_A2S_APPS` | User tapped app icon on head unit screen |
+| **Stereo $\rightarrow$ Phone** | `0x62` | `OP_A2S_REQUEST_PHONE_STATUS` | Stereo queries phone battery, call, and VR state (AppRadio Mode+) |
+| **Phone $\rightarrow$ Stereo** | `0x63` | `OP_S2A_SMARTPHONE_STATUS` | Phone status reply (subtype `0x20` + status flags) |
 
 ---
 
@@ -108,6 +110,22 @@ The SAC layer defines application-level control messages. All multibyte integers
 #### 5. Video Output Ready Handshake
 - **VideoOutputRequest (RX)**: Opcode `0x06`, Empty Payload
 - **VideoOutputReply (TX)**: Opcode `0x06`, Payload: `[ 0x06, 0x01 ]`
+
+#### 6. Smartphone Status Handshake (AppRadio Mode+ / Opcode 0x62 & 0x63)
+- **RequestPhoneStatus (RX)**: Opcode `0x62`, Payload: `[ 0x20 ]` (Subtype 32)
+- **SmartPhoneStatus (TX)**: Opcode `0x63`, Payload:
+  ```
+  Byte 0: 0x20 (Subtype: 32)
+  Byte 1: Status byte (e.g. 0x00 = Normal, battery OK, no active call)
+  ```
+  *Note*: If the phone fails to respond to Opcode `0x62` with Opcode `0x63`, the head unit firmware (such as on the Pioneer AVH-Z2090BT) will remain frozen on its "Loading..." screen.
+
+---
+
+## 3.3 MTP Transport & Control Channel Synchronization
+- **Port 12347 (Control Channel)**: The head unit initiates connection by transmitting an MTP SYN packet (empty payload) targeting Port 12347.
+- **Connection ACK (`isLast = false`)**: The phone must acknowledge this SYN with a 0-byte MTP packet with `isLast = false`. If `isLast` is set to `true`, the stereo interprets it as `SendCloseMtpMessage` and tears down the socket.
+- **1000ms Delay Before AuthBegin**: Following Pioneer's `ExtBaseService.handleConnecting()`, the phone must wait 1000ms after acknowledging Port 12347 before transmitting `AuthBegin` to allow the stereo's internal daemon to enter its listener loop.
 
 ---
 
