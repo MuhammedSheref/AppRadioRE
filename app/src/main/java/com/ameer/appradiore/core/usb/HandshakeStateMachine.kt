@@ -678,14 +678,14 @@ class HandshakeStateMachineImpl(
                     clientWidth = cmd.clientWidth,
                     clientHeight = cmd.clientHeight,
                     frameEncoding = 2, // H.264
-                    encoderParams = "maxKeyFrameInterval=60,bitrate=8388608"
+                    encoderParams = "maxKeyFrameInterval=60,bitrate=2097152"
                 )
                 val replyBytes = WebLinkCodec.encode(reply)
                 val replyHex = replyBytes.take(64).joinToString(" ") { String.format("%02X", it) }
                 logRepository.log(
                     direction = LogDirection.OUTGOING,
                     protocol = ProtocolType.WEBLINK,
-                    summary = "TX WebLink: VideoConfig Confirm (${w}x${h}, H.264 @ 8Mbps)",
+                    summary = "TX WebLink: VideoConfig Confirm (${w}x${h}, H.264 @ 2Mbps)",
                     rawHex = replyHex
                 )
                 if (isMtpMode) {

@@ -57,6 +57,11 @@ data class MTPPacket(
         const val PORT_CONTROL_CHANNEL = 12347
         const val PORT_VIDEO_CHANNEL = 12346
 
+        /** Maximum total MTP packet size (16 KB) supported by Pioneer head unit receive buffer */
+        const val MAX_FRAME_SIZE = 16384
+        /** Maximum payload size per MTP frame (16,284 bytes) per Pioneer MTPPacket.GetMaxDataSize() */
+        const val MAX_DATA_SIZE = 16284
+
         const val PROTOCOL_TCP = 0
         const val PROTOCOL_UDP = 1
 

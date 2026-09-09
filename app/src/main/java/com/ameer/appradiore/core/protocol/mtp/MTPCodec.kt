@@ -187,6 +187,33 @@ object MTPCodec {
     }
 
     /**
+     * Wraps an arbitrary payload into one or more MTP TCP Data Packets targeting a specified port.
+     * If the payload exceeds [MTPPacket.MAX_DATA_SIZE] (16,284 bytes), it is fragmented across multiple MTP packets
+     * matching ConnectionPointMTP.writeDataInternal from the Pioneer/WebLink specification.
+     */
+    fun wrapPayloadFragmented(
+        payload: ByteArray,
+        srcPort: Int,
+        dstPort: Int,
+        isLast: Boolean = false
+    ): List<ByteArray> {
+        if (payload.size <= MTPPacket.MAX_DATA_SIZE) {
+            return listOf(wrapPayload(payload, srcPort, dstPort, isLast))
+        }
+
+        val fragments = mutableListOf<ByteArray>()
+        var offset = 0
+        while (offset < payload.size) {
+            val chunkLen = minOf(payload.size - offset, MTPPacket.MAX_DATA_SIZE)
+            val chunk = payload.copyOfRange(offset, offset + chunkLen)
+            val isFinalFragment = (offset + chunkLen >= payload.size) && isLast
+            fragments.add(wrapPayload(chunk, srcPort, dstPort, isFinalFragment))
+            offset += chunkLen
+        }
+        return fragments
+    }
+
+    /**
      * Creates an MTP connection acknowledgment packet (empty payload) to confirm channel establishment.
      * Note: [isLast] MUST be false. In MTP, an empty payload with isLast=true signals SendCloseMtpMessage (connection teardown).
      */

@@ -13,12 +13,13 @@ import kotlinx.coroutines.launch
 
 /**
  * Android MediaCodec-based hardware H.264 video encoder.
- * Configured for 800x480 @ 30 FPS and 8 Mbps matching Pioneer AppRadio / WebLink specifications.
+ * Configured for 800x480 @ 30 FPS and 2 Mbps matching Pioneer AppRadio / WebLink specifications
+ * (caps keyframe size < 12 KB to avoid exceeding 16 KB MTP packet limits).
  */
 class H264VideoEncoder(
     private val width: Int = 800,
     private val height: Int = 480,
-    private val bitrate: Int = 8_388_608, // 8 Mbps
+    private val bitrate: Int = 2_000_000, // 2 Mbps
     private val fps: Int = 30,
     private val iFrameInterval: Int = 1,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
@@ -49,6 +50,12 @@ class H264VideoEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, iFrameInterval)
+                try {
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
+                    setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Baseline profile configuration omitted: ${e.message}")
+                }
                 // Repeat previous frame after 33ms if surface is idle
                 setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / fps)
             }

@@ -135,8 +135,8 @@ class VideoStreamingManagerImpl(
         )
         val webLinkBytes = WebLinkCodec.encode(fillRectangle)
 
-        // 2. Wrap in MTP Packet targeting Video Channel (Port 12346)
-        val mtpBytes = MTPCodec.wrapPayload(
+        // 2. Wrap in MTP Packet(s) targeting Video Channel (Port 12346), fragmented if > 16,284B
+        val mtpPackets = MTPCodec.wrapPayloadFragmented(
             payload = webLinkBytes,
             srcPort = MTPPacket.PORT_VIDEO_CHANNEL,
             dstPort = MTPPacket.PORT_VIDEO_CHANNEL
@@ -146,10 +146,17 @@ class VideoStreamingManagerImpl(
         scope.launch {
             try {
                 if (_isStreaming.value) {
-                    val success = usbAccessoryManager.send(mtpBytes)
-                    if (success) {
+                    var allSuccess = true
+                    for (packet in mtpPackets) {
+                        val success = usbAccessoryManager.send(packet)
+                        if (!success) {
+                            allSuccess = false
+                            break
+                        }
+                    }
+                    if (allSuccess) {
                         _framesSent.value++
-                        _bytesSent.value += mtpBytes.size
+                        _bytesSent.value += webLinkBytes.size
                         framesInCurrentSecond.incrementAndGet()
                     } else {
                         logRepository.log(
