@@ -300,6 +300,26 @@ class HandshakeStateMachineImpl(
                 summary = "TX MTP Connection ACK sent to ${packet.srcAddress}"
             )
 
+            if (isVideo) {
+                // Pioneer WLServer.onConnectionEstablished sends SetCurrentApp("aam2serverapp://")
+                // immediately upon Port 12346 connection to notify stereo WebLink client of active server
+                val setAppCmd = WebLinkCommand.SetCurrentApp(appId = WebLinkCommand.APP_ID_AAM2, appParams = "")
+                val setAppBytes = WebLinkCodec.encode(setAppCmd)
+                val setAppHex = setAppBytes.take(64).joinToString(" ") { String.format("%02X", it) }
+                logRepository.log(
+                    direction = LogDirection.OUTGOING,
+                    protocol = ProtocolType.WEBLINK,
+                    summary = "TX WebLink: SetCurrentApp (\"${WebLinkCommand.APP_ID_AAM2}\") on Port 12346",
+                    rawHex = setAppHex
+                )
+                val setAppMtpVideo = MTPCodec.wrapPayload(
+                    payload = setAppBytes,
+                    srcPort = MTPPacket.PORT_VIDEO_CHANNEL,
+                    dstPort = packet.srcAddress.port
+                )
+                usbAccessoryManager.send(setAppMtpVideo)
+            }
+
             if (isControl && !isSacAuthenticated) {
                 // Cancel fallback timer since MTP control channel exists
                 fallbackJob?.cancel()
