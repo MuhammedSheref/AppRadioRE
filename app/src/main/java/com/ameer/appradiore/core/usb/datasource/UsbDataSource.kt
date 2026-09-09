@@ -18,7 +18,10 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
@@ -40,6 +43,7 @@ class UsbDataSourceImpl(
 
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
 
+    private val writeMutex = Mutex()
     private val _incomingBytes = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
     override val incomingBytes: SharedFlow<ByteArray> = _incomingBytes.asSharedFlow()
 
@@ -104,32 +108,49 @@ class UsbDataSourceImpl(
 
     override suspend fun write(data: ByteArray): EmptyResult<DataError.Usb> = withContext(Dispatchers.IO) {
         val stream = outputStream ?: return@withContext Result.Error(DataError.Usb.STREAM_CLOSED)
-        try {
-            val hexPreview = data.take(64).joinToString(" ") { String.format("%02X", it) }
-            val suffix = if (data.size > 64) " ... (${data.size} bytes total)" else ""
-            logRepository.log(
-                direction = LogDirection.OUTGOING,
-                protocol = ProtocolType.RAW,
-                summary = "TX Raw USB Chunk (${data.size} bytes)",
-                rawHex = hexPreview + suffix
-            )
-            // USB write chunking matching UsbAccessoryLayer.writeDataInternal() from Pioneer OEM source:
-            // max 5000 bytes per chunk. If chunkSize % 512 == 0, reduce by 257 bytes to prevent USB ZLP stalls.
-            var offset = 0
-            var remaining = data.size
-            while (remaining > 0) {
-                var chunkSize = minOf(5000, remaining)
-                if (chunkSize % 512 == 0) {
-                    chunkSize -= 257
+        writeMutex.withLock {
+            try {
+                val hexPreview = data.take(64).joinToString(" ") { String.format("%02X", it) }
+                val suffix = if (data.size > 64) " ... (${data.size} bytes total)" else ""
+                logRepository.log(
+                    direction = LogDirection.OUTGOING,
+                    protocol = ProtocolType.RAW,
+                    summary = "TX Raw USB Chunk (${data.size} bytes)",
+                    rawHex = hexPreview + suffix
+                )
+
+                val writeSuccess = withTimeoutOrNull(2500L) {
+                    // USB write chunking matching UsbAccessoryLayer.writeDataInternal() from Pioneer OEM source:
+                    // max 5000 bytes per chunk. If chunkSize % 512 == 0, reduce by 257 bytes to prevent USB ZLP stalls.
+                    var offset = 0
+                    var remaining = data.size
+                    while (remaining > 0) {
+                        var chunkSize = minOf(5000, remaining)
+                        if (chunkSize % 512 == 0) {
+                            chunkSize -= 257
+                        }
+                        stream.write(data, offset, chunkSize)
+                        offset += chunkSize
+                        remaining -= chunkSize
+                    }
+                    stream.flush()
+                    true
                 }
-                stream.write(data, offset, chunkSize)
-                offset += chunkSize
-                remaining -= chunkSize
+
+                if (writeSuccess == null) {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.RAW,
+                        summary = "USB Write timed out after 2500ms (${data.size} bytes)",
+                        isError = true
+                    )
+                    Result.Error(DataError.Usb.IO_ERROR)
+                } else {
+                    Result.Success(Unit)
+                }
+            } catch (e: Exception) {
+                Result.Error(DataError.Usb.IO_ERROR)
             }
-            stream.flush()
-            Result.Success(Unit)
-        } catch (e: Exception) {
-            Result.Error(DataError.Usb.IO_ERROR)
         }
     }
 

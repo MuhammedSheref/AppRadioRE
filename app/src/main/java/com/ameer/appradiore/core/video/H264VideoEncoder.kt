@@ -13,13 +13,12 @@ import kotlinx.coroutines.launch
 
 /**
  * Android MediaCodec-based hardware H.264 video encoder.
- * Configured for 800x480 @ 30 FPS and 2 Mbps matching Pioneer AppRadio / WebLink specifications
- * (caps keyframe size < 12 KB to avoid exceeding 16 KB MTP packet limits).
+ * Configured for 800x480 @ 30 FPS and 8 Mbps matching Pioneer AppRadio / WebLink specifications.
  */
 class H264VideoEncoder(
     private val width: Int = 800,
     private val height: Int = 480,
-    private val bitrate: Int = 2_000_000, // 2 Mbps
+    private val bitrate: Int = 8_388_608, // 8 Mbps (matching Pioneer AppRadio / WebLink VideoConfig request)
     private val fps: Int = 30,
     private val iFrameInterval: Int = 1,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)

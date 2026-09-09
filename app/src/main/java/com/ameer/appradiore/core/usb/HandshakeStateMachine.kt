@@ -64,7 +64,10 @@ class HandshakeStateMachineImpl(
     private var heartbeatJob: Job? = null
     private var authJob: Job? = null
     private var fallbackJob: Job? = null
+    @Volatile
     private var isMtpMode: Boolean = true
+    @Volatile
+    private var controlChannelReady: Boolean = false
     private var isSacAuthenticated: Boolean = false
     private var stereoControlPort: Int = MTPPacket.PORT_CONTROL_CHANNEL
     private var stereoAddress: MTPAddress = MTPAddress.ANY_CONTROL
@@ -93,6 +96,7 @@ class HandshakeStateMachineImpl(
     override fun startHandshake() {
         reset()
         isMtpMode = true
+        controlChannelReady = false
         _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
         logRepository.log(
             direction = LogDirection.INTERNAL,
@@ -105,18 +109,28 @@ class HandshakeStateMachineImpl(
             }
         }
 
-        // Fallback for legacy non-MTP direct USB Pioneer head units (e.g. raw PFormat over USB).
-        // If no MTP connection request is received within 4 seconds, initiate bare AuthBegin.
+        // Fallback: If no auth was scheduled after 4 seconds, initiate AuthBegin.
+        // If MTP control channel was established (controlChannelReady), keep isMtpMode = true
+        // and send auth over MTP. Otherwise, fall back to bare PFormat for legacy head units.
         fallbackJob = scope.launch {
             delay(4000L)
-            if (!isSacAuthenticated && authJob == null) {
-                logRepository.log(
-                    direction = LogDirection.INTERNAL,
-                    protocol = ProtocolType.SYSTEM,
-                    summary = "No MTP connection request received within 4s. Attempting fallback direct AuthBegin..."
-                )
-                isMtpMode = false
-                scheduleAuthSequence(delayMs = 0L, source = "Non-MTP Fallback")
+            if (!isSacAuthenticated && (authJob == null || authJob?.isActive != true)) {
+                if (controlChannelReady) {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.SYSTEM,
+                        summary = "Auth not yet started after 4s. MTP control channel is established; sending AuthBegin via MTP..."
+                    )
+                    // Keep isMtpMode = true — stereo expects MTP-wrapped SAC on Port 12347
+                } else {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.SYSTEM,
+                        summary = "No MTP connection request received within 4s. Attempting fallback direct AuthBegin..."
+                    )
+                    isMtpMode = false
+                }
+                scheduleAuthSequence(delayMs = 0L, source = if (controlChannelReady) "MTP Fallback" else "Non-MTP Fallback")
             }
         }
     }
@@ -145,7 +159,18 @@ class HandshakeStateMachineImpl(
                     protocol = ProtocolType.SYSTEM,
                     summary = "Sending AuthBegin (Attempt $attempt of 5)..."
                 )
-                sendSacCommand(SACCommand.AuthBegin)
+                try {
+                    sendSacCommand(SACCommand.AuthBegin)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e // Don't swallow coroutine cancellation
+                } catch (e: Exception) {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.SYSTEM,
+                        summary = "AuthBegin attempt $attempt failed: ${e.message}",
+                        isError = true
+                    )
+                }
                 attempt++
                 delay(3000L)
             }
@@ -669,23 +694,24 @@ class HandshakeStateMachineImpl(
                     isReadyForVideo = true
                 )
 
-                // NOTE: Do NOT cancel authJob! WebLink (Port 12346) and SAC (Port 12347) are concurrent channels.
+                // Dynamically resolve encoder params for H.264 matching stereo request
+                val confirmedParams = resolveEncoderParams(cmd.encoderParams, encodingType = 2)
 
-                // Reply confirming video config: 800x480 H.264
+                // Reply confirming video config: H.264 matching stereo request
                 val reply = WebLinkCommand.VideoConfig(
                     sourceWidth = cmd.sourceWidth,
                     sourceHeight = cmd.sourceHeight,
                     clientWidth = cmd.clientWidth,
                     clientHeight = cmd.clientHeight,
                     frameEncoding = 2, // H.264
-                    encoderParams = "maxKeyFrameInterval=60,bitrate=2097152"
+                    encoderParams = confirmedParams
                 )
                 val replyBytes = WebLinkCodec.encode(reply)
                 val replyHex = replyBytes.take(64).joinToString(" ") { String.format("%02X", it) }
                 logRepository.log(
                     direction = LogDirection.OUTGOING,
                     protocol = ProtocolType.WEBLINK,
-                    summary = "TX WebLink: VideoConfig Confirm (${w}x${h}, H.264 @ 2Mbps)",
+                    summary = "TX WebLink: VideoConfig Confirm (${w}x${h}, H.264, params='$confirmedParams')",
                     rawHex = replyHex
                 )
                 if (isMtpMode) {
@@ -738,6 +764,26 @@ class HandshakeStateMachineImpl(
             }
             else -> Unit
         }
+    }
+
+    private fun resolveEncoderParams(requestedParams: String, encodingType: Int = 2): String {
+        if (requestedParams.isBlank()) {
+            return "maxKeyFrameInterval=60,bitrate=8388608,fps=30"
+        }
+        val entries = requestedParams.split(';')
+        for (entry in entries) {
+            val trimmed = entry.trim()
+            if (trimmed.startsWith("$encodingType:")) {
+                return trimmed.substringAfter("$encodingType:").trim()
+            }
+        }
+        if (requestedParams.startsWith("$encodingType:")) {
+            return requestedParams.substringAfter("$encodingType:").trim()
+        }
+        if (requestedParams.contains("=") && !requestedParams.contains(":")) {
+            return requestedParams.trim()
+        }
+        return "maxKeyFrameInterval=60,bitrate=8388608,fps=30"
     }
 
     private fun startHeartbeat() {

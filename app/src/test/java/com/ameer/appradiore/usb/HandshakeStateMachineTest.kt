@@ -363,4 +363,58 @@ class HandshakeStateMachineTest {
 
         stateMachine.reset()
     }
+
+    @Test
+    fun testWebLinkVideoConfigEncoderParamsResolution() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val testScope = TestScope(testDispatcher)
+
+        val fakeUsb = FakeUsbAccessoryManager()
+        val logRepo = LogRepositoryImpl()
+        val stateMachine = HandshakeStateMachineImpl(fakeUsb, logRepo, testScope)
+        testScope.advanceUntilIdle()
+
+        stateMachine.startHandshake()
+        testScope.testScheduler.runCurrent()
+
+        // Stereo requests VideoConfig on Port 12346 with Pioneer parameters
+        val videoConfigCmd = com.ameer.appradiore.core.protocol.weblink.WebLinkCommand.VideoConfig(
+            sourceWidth = 800,
+            sourceHeight = 480,
+            clientWidth = 800,
+            clientHeight = 480,
+            frameEncoding = 2,
+            encoderParams = "2:maxKeyFrameInterval=60,bitrate=8388608,fps=30"
+        )
+        val videoConfigPayload = com.ameer.appradiore.core.protocol.weblink.WebLinkCodec.encode(videoConfigCmd)
+        val videoConfigPacket = com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapPayload(
+            payload = videoConfigPayload,
+            srcPort = com.ameer.appradiore.core.protocol.mtp.MTPPacket.PORT_VIDEO_CHANNEL,
+            dstPort = com.ameer.appradiore.core.protocol.mtp.MTPPacket.PORT_VIDEO_CHANNEL
+        )
+
+        fakeUsb.incomingBytes.emit(videoConfigPacket)
+        testScope.testScheduler.runCurrent()
+
+        // Verify that the reply confirms VideoConfig and extracted parameters correctly
+        val replyMtp = fakeUsb.sentBytes.firstOrNull { bytes ->
+            val decoded = com.ameer.appradiore.core.protocol.mtp.MTPCodec.decode(bytes)
+            decoded.packets.any { packet ->
+                val wlCmds = com.ameer.appradiore.core.protocol.weblink.WebLinkCodec.decode(packet.payload)
+                wlCmds.any { it is com.ameer.appradiore.core.protocol.weblink.WebLinkCommand.VideoConfig }
+            }
+        }
+        org.junit.Assert.assertNotNull("VideoConfig reply should be sent", replyMtp)
+
+        val mtpPackets = com.ameer.appradiore.core.protocol.mtp.MTPCodec.decode(replyMtp!!).packets
+        val confirmedCmd = com.ameer.appradiore.core.protocol.weblink.WebLinkCodec.decode(mtpPackets[0].payload)[0]
+                as com.ameer.appradiore.core.protocol.weblink.WebLinkCommand.VideoConfig
+
+        assertEquals(800, confirmedCmd.clientWidth)
+        assertEquals(480, confirmedCmd.clientHeight)
+        assertEquals(2, confirmedCmd.frameEncoding)
+        assertEquals("maxKeyFrameInterval=60,bitrate=8388608,fps=30", confirmedCmd.encoderParams)
+
+        stateMachine.reset()
+    }
 }
