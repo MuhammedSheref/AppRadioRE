@@ -6,7 +6,7 @@ package com.ameer.appradiore.core.protocol.mtp
  */
 data class MTPAddress(
     val addressType: Byte = TYPE_IPV4,
-    val ip: ByteArray = ByteArray(4) { 0 }, // 0.0.0.0
+    val ip: ByteArray = LOOPBACK_IP, // 127.0.0.1
     val port: Int = 0
 ) {
     companion object {
@@ -14,8 +14,9 @@ data class MTPAddress(
         const val TYPE_IPV4: Byte = 1
         const val TYPE_IPV6: Byte = 2
 
-        val ANY_CONTROL = MTPAddress(TYPE_IPV4, ByteArray(4) { 0 }, MTPPacket.PORT_CONTROL_CHANNEL)
-        val ANY_VIDEO = MTPAddress(TYPE_IPV4, ByteArray(4) { 0 }, MTPPacket.PORT_VIDEO_CHANNEL)
+        val LOOPBACK_IP = byteArrayOf(127, 0, 0, 1)
+        val ANY_CONTROL = MTPAddress(TYPE_IPV4, LOOPBACK_IP, MTPPacket.PORT_CONTROL_CHANNEL)
+        val ANY_VIDEO = MTPAddress(TYPE_IPV4, LOOPBACK_IP, MTPPacket.PORT_VIDEO_CHANNEL)
     }
 
     override fun equals(other: Any?): Boolean {
@@ -42,7 +43,7 @@ data class MTPAddress(
  */
 data class MTPPacket(
     val messageType: Int = TYPE_DATA,
-    val isLast: Boolean = true,
+    val isLast: Boolean = false,
     val sourceProtocol: Int = PROTOCOL_TCP,
     val isCompressed: Boolean = false,
     val srcAddress: MTPAddress,
@@ -73,7 +74,7 @@ data class MTPPacket(
             srcAddress: MTPAddress,
             dstAddress: MTPAddress,
             payload: ByteArray,
-            isLast: Boolean = true
+            isLast: Boolean = false
         ): MTPPacket {
             return MTPPacket(
                 messageType = TYPE_DATA,

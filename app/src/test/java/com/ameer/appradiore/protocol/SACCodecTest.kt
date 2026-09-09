@@ -102,4 +102,18 @@ class SACCodecTest {
         val encoded = SACCodec.encode(SACCommand.VideoOutputReply)
         assertArrayEquals(byteArrayOf(0x06, 0x01), encoded)
     }
+
+    @Test
+    fun testEncodeSmartPhoneStatus() {
+        val encoded = SACCodec.encode(SACCommand.SmartPhoneStatus(statusType = 0x20))
+        assertArrayEquals(byteArrayOf(0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00), encoded)
+    }
+
+    @Test
+    fun testDecodeRequestPhoneStatus() {
+        val payload = byteArrayOf(0x20)
+        val decoded = SACCodec.decode(SACCommand.OP_A2S_NOTIFYREQUEST, payload)
+        assertTrue(decoded is SACCommand.RequestPhoneStatus)
+        assertEquals(0x20.toByte(), (decoded as SACCommand.RequestPhoneStatus).statusType)
+    }
 }

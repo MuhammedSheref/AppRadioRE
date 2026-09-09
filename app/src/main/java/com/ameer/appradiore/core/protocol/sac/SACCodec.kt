@@ -103,6 +103,14 @@ object SACCodec {
             is SACCommand.TerminateSession -> {
                 dos.writeByte(cmd.type.toInt())
             }
+            is SACCommand.SmartPhoneStatus -> {
+                dos.writeByte(cmd.statusType.toInt())
+                dos.writeByte(cmd.hdmiPackage.toInt())
+                dos.writeByte(cmd.soundCategory.toInt())
+                dos.writeByte(0)
+                dos.writeShort(cmd.appToken.toInt())
+                dos.writeByte(0)
+            }
             is SACCommand.UnknownSACCommand -> {
                 dos.write(cmd.rawPayload)
             }
@@ -117,6 +125,10 @@ object SACCodec {
      * Parses an incoming (A2S) SAC command based on its opcode and payload buffer.
      */
     fun decode(opcode: Byte, payload: ByteArray): SACCommand {
+        if (opcode == SACCommand.OP_A2S_VEDIO_OUTPUT) {
+            return SACCommand.VideoOutputRequest
+        }
+
         if (payload.isEmpty()) {
             return SACCommand.UnknownSACCommand(opcode, payload)
         }
@@ -127,6 +139,7 @@ object SACCodec {
                 SACCommand.OP_A2S_AUTH -> decodeAuth(dis, payload)
                 SACCommand.OP_A2S_PROC_SPEC -> decodeProcSpec(dis, payload)
                 SACCommand.OP_A2S_PACKAGEINFO -> decodePackageInfo(dis, payload)
+                SACCommand.OP_A2S_NOTIFYREQUEST -> decodeNotifyRequest(dis, payload)
                 SACCommand.OP_A2S_VEDIO_OUTPUT -> SACCommand.VideoOutputRequest
                 SACCommand.OP_A2S_APPINFO_REQUEST -> decodeAppInfoRequest(dis, payload)
                 SACCommand.OP_A2S_APPIMAGE_TRANSFER_REQUEST -> decodeAppImageRequest(dis, payload)
@@ -137,6 +150,11 @@ object SACCodec {
         } catch (e: Exception) {
             SACCommand.UnknownSACCommand(opcode, payload)
         }
+    }
+
+    private fun decodeNotifyRequest(dis: DataInputStream, raw: ByteArray): SACCommand {
+        val statusType = if (dis.available() > 0) dis.readByte() else 0x20.toByte()
+        return SACCommand.RequestPhoneStatus(statusType)
     }
 
     private fun decodeAuth(dis: DataInputStream, raw: ByteArray): SACCommand {

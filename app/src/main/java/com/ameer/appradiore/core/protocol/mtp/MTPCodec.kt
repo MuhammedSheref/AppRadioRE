@@ -163,7 +163,7 @@ object MTPCodec {
         payload: ByteArray,
         srcPort: Int = MTPPacket.PORT_CONTROL_CHANNEL,
         dstPort: Int = MTPPacket.PORT_CONTROL_CHANNEL,
-        isLast: Boolean = true
+        isLast: Boolean = false
     ): ByteArray {
         return wrapPayload(payload, srcPort, dstPort, isLast)
     }
@@ -175,11 +175,11 @@ object MTPCodec {
         payload: ByteArray,
         srcPort: Int,
         dstPort: Int,
-        isLast: Boolean = true
+        isLast: Boolean = false
     ): ByteArray {
         val packet = MTPPacket.createDataPacket(
-            srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, srcPort),
-            dstAddress = MTPAddress(MTPAddress.TYPE_IPV4, ByteArray(4) { 0 }, dstPort),
+            srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, MTPAddress.LOOPBACK_IP, srcPort),
+            dstAddress = MTPAddress(MTPAddress.TYPE_IPV4, MTPAddress.LOOPBACK_IP, dstPort),
             payload = payload,
             isLast = isLast
         )
@@ -188,6 +188,7 @@ object MTPCodec {
 
     /**
      * Creates an MTP connection acknowledgment packet (empty payload) to confirm channel establishment.
+     * Note: [isLast] MUST be false. In MTP, an empty payload with isLast=true signals SendCloseMtpMessage (connection teardown).
      */
     fun createConnectionAck(
         srcAddress: MTPAddress,
@@ -197,7 +198,7 @@ object MTPCodec {
             srcAddress = srcAddress,
             dstAddress = dstAddress,
             payload = ByteArray(0),
-            isLast = true
+            isLast = false
         )
         return encode(packet)
     }

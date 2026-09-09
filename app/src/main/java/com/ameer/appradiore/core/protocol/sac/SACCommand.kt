@@ -174,7 +174,7 @@ sealed class SACCommand {
         val minorVersion: Short
     ) : SACCommand() {
         override val opcode: Byte = OP_A2S_AUTH
-        val isSuccess: Boolean get() = result.toInt() == 1
+        val isSuccess: Boolean get() = result.toInt() != 0 || majorVersion > 0
     }
 
     data class StartAppAccReply(val result: Byte) : SACCommand() {
@@ -269,6 +269,21 @@ sealed class SACCommand {
         override val opcode: Byte = OP_A2S_APPS
     }
 
+    data class RequestPhoneStatus(
+        val statusType: Byte = 0x20 // 0x20 = AccessoryStatus/Park, 0x21 = Media
+    ) : SACCommand() {
+        override val opcode: Byte = OP_A2S_NOTIFYREQUEST
+    }
+
+    data class SmartPhoneStatus(
+        val statusType: Byte = 0x20,
+        val hdmiPackage: Byte = 0x00,
+        val soundCategory: Byte = 0x01,
+        val appToken: Short = 0
+    ) : SACCommand() {
+        override val opcode: Byte = OP_S2A_NOTIFICATION
+    }
+
     data class UnknownSACCommand(
         override val opcode: Byte,
         val rawPayload: ByteArray
@@ -306,6 +321,8 @@ sealed class SACCommand {
         const val OP_A2S_APPS: Byte = 83
         const val OP_S2A_ACCESSORY_STATUS: Byte = 96
         const val OP_A2S_PACKAGEINFO: Byte = 97
+        const val OP_A2S_NOTIFYREQUEST: Byte = 98 // 0x62
+        const val OP_S2A_NOTIFICATION: Byte = 99  // 0x63
         const val OP_S2A_APPNINFO_RELY: Byte = 112
         const val OP_A2S_APPINFO_REQUEST: Byte = 113
         const val OP_S2A_TRACKNFO_RELY: Byte = 114

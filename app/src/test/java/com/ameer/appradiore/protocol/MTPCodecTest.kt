@@ -34,10 +34,22 @@ class MTPCodecTest {
         val decoded = result.packets[0]
         assertEquals(MTPPacket.TYPE_DATA, decoded.messageType)
         assertEquals(MTPPacket.PROTOCOL_TCP, decoded.sourceProtocol)
-        assertTrue(decoded.isLast)
+        org.junit.Assert.assertFalse(decoded.isLast)
         assertEquals(12347, decoded.srcAddress.port)
         assertEquals(12347, decoded.dstAddress.port)
         assertArrayEquals(samplePayload, decoded.payload)
+    }
+
+    @Test
+    fun testExplicitIsLastPacket() {
+        val src = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), 12347)
+        val dst = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), 12347)
+        val packet = MTPPacket.createDataPacket(src, dst, ByteArray(0), isLast = true)
+        val encoded = MTPCodec.encode(packet)
+        val result = MTPCodec.decode(encoded)
+
+        assertEquals(1, result.packets.size)
+        assertTrue(result.packets[0].isLast)
     }
 
     @Test

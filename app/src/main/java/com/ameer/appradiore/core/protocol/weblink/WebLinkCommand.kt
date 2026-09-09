@@ -11,7 +11,7 @@ sealed class WebLinkCommand {
     abstract val commandId: Short
 
     data class SetCurrentApp(
-        val appId: String = "wlhome_1.0://",
+        val appId: String = APP_ID_AAM2,
         val appParams: String = ""
     ) : WebLinkCommand() {
         override val commandId: Short = ID_SET_CURRENT_APP
@@ -121,6 +121,10 @@ sealed class WebLinkCommand {
         const val MAGIC_BYTE1: Byte = 0x57 // 'W'
         const val MAGIC_BYTE2: Byte = 0x4C // 'L'
         const val HEADER_SIZE = 8
+
+        const val APP_ID_AAM2 = "aam2serverapp://"
+        const val SERVER_NAME_AAM2 = "AAM2ServerApp"
+        const val APP_ID_GENERIC_WEBLINK = "wlhome_1.0://"
 
         const val ID_FILL_RECTANGLE: Short = 1
         const val ID_MOUSE_COMMAND: Short = 16
