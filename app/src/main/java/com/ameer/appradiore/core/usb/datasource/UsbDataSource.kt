@@ -108,18 +108,18 @@ class UsbDataSourceImpl(
 
     override suspend fun write(data: ByteArray): EmptyResult<DataError.Usb> = withContext(Dispatchers.IO) {
         val stream = outputStream ?: return@withContext Result.Error(DataError.Usb.STREAM_CLOSED)
-        writeMutex.withLock {
-            try {
-                val hexPreview = data.take(64).joinToString(" ") { String.format("%02X", it) }
-                val suffix = if (data.size > 64) " ... (${data.size} bytes total)" else ""
-                logRepository.log(
-                    direction = LogDirection.OUTGOING,
-                    protocol = ProtocolType.RAW,
-                    summary = "TX Raw USB Chunk (${data.size} bytes)",
-                    rawHex = hexPreview + suffix
-                )
+        val writeSuccess = withTimeoutOrNull(2500L) {
+            writeMutex.withLock {
+                try {
+                    val hexPreview = data.take(64).joinToString(" ") { String.format("%02X", it) }
+                    val suffix = if (data.size > 64) " ... (${data.size} bytes total)" else ""
+                    logRepository.log(
+                        direction = LogDirection.OUTGOING,
+                        protocol = ProtocolType.RAW,
+                        summary = "TX Raw USB Chunk (${data.size} bytes)",
+                        rawHex = hexPreview + suffix
+                    )
 
-                val writeSuccess = withTimeoutOrNull(2500L) {
                     // USB write chunking matching UsbAccessoryLayer.writeDataInternal() from Pioneer OEM source:
                     // max 5000 bytes per chunk. If chunkSize % 512 == 0, reduce by 257 bytes to prevent USB ZLP stalls.
                     var offset = 0
@@ -135,22 +135,22 @@ class UsbDataSourceImpl(
                     }
                     stream.flush()
                     true
+                } catch (e: Exception) {
+                    false
                 }
-
-                if (writeSuccess == null) {
-                    logRepository.log(
-                        direction = LogDirection.INTERNAL,
-                        protocol = ProtocolType.RAW,
-                        summary = "USB Write timed out after 2500ms (${data.size} bytes)",
-                        isError = true
-                    )
-                    Result.Error(DataError.Usb.IO_ERROR)
-                } else {
-                    Result.Success(Unit)
-                }
-            } catch (e: Exception) {
-                Result.Error(DataError.Usb.IO_ERROR)
             }
+        }
+
+        if (writeSuccess == true) {
+            Result.Success(Unit)
+        } else {
+            logRepository.log(
+                direction = LogDirection.INTERNAL,
+                protocol = ProtocolType.RAW,
+                summary = "USB Write timed out or failed (${data.size} bytes)",
+                isError = true
+            )
+            Result.Error(DataError.Usb.IO_ERROR)
         }
     }
 
