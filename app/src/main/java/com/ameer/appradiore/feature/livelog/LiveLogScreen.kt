@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
@@ -130,12 +131,14 @@ fun LiveLogScreen(
                     }
                 },
                 actions = {
-                    IconButton(onClick = { onAction(LiveLogAction.OnSimulateHandshakeClick) }) {
-                        Icon(
-                            Icons.Default.PlayArrow,
-                            contentDescription = "Simulate Handshake",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
+                    if (state.connectionState !is UsbConnectionState.Connected) {
+                        IconButton(onClick = { onAction(LiveLogAction.OnSimulateHandshakeClick) }) {
+                            Icon(
+                                Icons.Default.BugReport,
+                                contentDescription = "Test Offline Mock Demo (No Car Connected)",
+                                tint = MaterialTheme.colorScheme.tertiary
+                            )
+                        }
                     }
                     IconButton(
                         onClick = { onAction(LiveLogAction.OnExportLogsClick) },
