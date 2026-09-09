@@ -37,7 +37,8 @@ class TestPatternRenderer(
     private val width: Int = 800,
     private val height: Int = 480,
     private val fps: Int = 30,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),
+    private val onError: ((String) -> Unit)? = null
 ) {
     companion object {
         private const val TAG = "TestPatternRenderer"
@@ -188,13 +189,19 @@ class TestPatternRenderer(
         try {
             if (!initEgl()) {
                 Log.e(TAG, "Failed to initialize EGL for test pattern renderer")
+                onError?.invoke("Failed to initialize EGL for MediaCodec surface")
                 return
             }
 
             val framePeriodNs = 1_000_000_000L / fps
             var nextFrameNs = System.nanoTime()
 
-            while (isRunning && !Thread.currentThread().isInterrupted && surface.isValid) {
+            while (isRunning && !Thread.currentThread().isInterrupted) {
+                if (!surface.isValid) {
+                    Log.w(TAG, "MediaCodec input surface is no longer valid")
+                    onError?.invoke("MediaCodec input surface invalidated")
+                    break
+                }
                 val canvas = offscreenCanvas ?: break
                 val bmp = bitmap ?: break
 
@@ -216,6 +223,7 @@ class TestPatternRenderer(
             // Normal shutdown
         } catch (e: Exception) {
             Log.e(TAG, "Error in TestPatternRenderer loop", e)
+            onError?.invoke("TestPatternRenderer exception: ${e.message}")
         } finally {
             releaseEgl()
         }
@@ -337,11 +345,17 @@ class TestPatternRenderer(
     }
 
     private fun renderToGl(bmp: Bitmap, isFirstFrame: Boolean) {
+        GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 4)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         if (isFirstFrame) {
             GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
         } else {
-            GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bmp)
+            try {
+                GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bmp)
+            } catch (e: Exception) {
+                Log.w(TAG, "texSubImage2D failed, falling back to texImage2D", e)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+            }
         }
 
         GLES20.glViewport(0, 0, width, height)

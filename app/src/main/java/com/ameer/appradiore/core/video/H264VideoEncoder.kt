@@ -21,7 +21,8 @@ class H264VideoEncoder(
     private val bitrate: Int = 8_388_608, // 8 Mbps (matching Pioneer AppRadio / WebLink VideoConfig request)
     private val fps: Int = 30,
     private val iFrameInterval: Int = 1,
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default)
+    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),
+    private val onError: ((String) -> Unit)? = null
 ) : VideoEncoder {
 
     companion object {
@@ -107,7 +108,11 @@ class H264VideoEncoder(
                             } else {
                                 chunk
                             }
-                            onFrameEncoded(payload)
+                            try {
+                                onFrameEncoded(payload)
+                            } catch (dispatchEx: Exception) {
+                                Log.w(TAG, "Frame dispatch callback threw exception", dispatchEx)
+                            }
                         }
                     }
                     mediaCodec.releaseOutputBuffer(outputBufferIndex, false)
@@ -118,6 +123,7 @@ class H264VideoEncoder(
             } catch (e: Exception) {
                 if (isRunning) {
                     Log.w(TAG, "Exception during MediaCodec drain", e)
+                    onError?.invoke("MediaCodec drain error: ${e.message}")
                 }
                 break
             }

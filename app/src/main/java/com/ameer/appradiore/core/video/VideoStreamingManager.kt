@@ -9,10 +9,12 @@ import com.ameer.appradiore.core.protocol.mtp.MTPPacket
 import com.ameer.appradiore.core.protocol.weblink.WebLinkCodec
 import com.ameer.appradiore.core.protocol.weblink.WebLinkCommand
 import com.ameer.appradiore.core.usb.UsbAccessoryManager
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -43,8 +45,22 @@ class VideoStreamingManagerImpl(
     private val usbAccessoryManager: UsbAccessoryManager,
     private val logRepository: LogRepository,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val encoderFactory: (width: Int, height: Int, fps: Int) -> VideoEncoder = { w, h, f ->
-        H264VideoEncoder(width = w, height = h, fps = f, scope = scope)
+        H264VideoEncoder(
+            width = w,
+            height = h,
+            fps = f,
+            scope = scope,
+            onError = { errMsg ->
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "H264 Encoder Error: $errMsg",
+                    isError = true
+                )
+            }
+        )
     },
     private val rendererFactory: ((surface: Surface, width: Int, height: Int, fps: Int) -> TestPatternRenderer)? = null
 ) : VideoStreamingManager {
@@ -65,7 +81,10 @@ class VideoStreamingManagerImpl(
     private var activeRenderer: TestPatternRenderer? = null
     private var fpsCounterJob: Job? = null
     private val framesInCurrentSecond = AtomicLong(0)
-    private val isTransmittingFrame = AtomicBoolean(false)
+
+    private class EncodedFrame(val frameData: ByteArray, val width: Int, val height: Int)
+    private var frameChannel: Channel<EncodedFrame>? = null
+    private var frameSenderJob: Job? = null
 
     override fun startStreaming(width: Int, height: Int, fps: Int) {
         if (_isStreaming.value) return
@@ -76,6 +95,66 @@ class VideoStreamingManagerImpl(
                 protocol = ProtocolType.SYSTEM,
                 summary = "Initializing Video Pipeline: ${width}x${height} @ ${fps}fps (H.264)"
             )
+
+            val channel = Channel<EncodedFrame>(capacity = Channel.CONFLATED)
+            frameChannel = channel
+
+            frameSenderJob = scope.launch(ioDispatcher) {
+                for (item in channel) {
+                    if (!_isStreaming.value) break
+                    try {
+                        // 1. Wrap in WebLink FillRectangleCommand (ID 1)
+                        val fillRectangle = WebLinkCommand.FillRectangle(
+                            width = item.width,
+                            height = item.height,
+                            encodingType = 2, // H.264
+                            appId = 0,
+                            frameData = item.frameData
+                        )
+                        val webLinkBytes = WebLinkCodec.encode(fillRectangle)
+
+                        // 2. Wrap in MTP Packet(s) targeting Video Channel (Port 12346), fragmented if > 16,284B
+                        val mtpPackets = MTPCodec.wrapPayloadFragmented(
+                            payload = webLinkBytes,
+                            srcPort = MTPPacket.PORT_VIDEO_CHANNEL,
+                            dstPort = MTPPacket.PORT_VIDEO_CHANNEL
+                        )
+
+                        // 3. Transmit via UsbAccessoryManager
+                        var allSuccess = true
+                        for (packet in mtpPackets) {
+                            val success = usbAccessoryManager.send(packet)
+                            if (!success) {
+                                allSuccess = false
+                                break
+                            }
+                        }
+                        if (allSuccess) {
+                            _framesSent.value++
+                            _bytesSent.value += webLinkBytes.size
+                            framesInCurrentSecond.incrementAndGet()
+                        } else {
+                            logRepository.log(
+                                direction = LogDirection.INTERNAL,
+                                protocol = ProtocolType.SYSTEM,
+                                summary = "USB write failed during video streaming; stopping stream",
+                                isError = true
+                            )
+                            stopStreaming()
+                            break
+                        }
+                    } catch (e: Exception) {
+                        if (_isStreaming.value) {
+                            logRepository.log(
+                                direction = LogDirection.INTERNAL,
+                                protocol = ProtocolType.SYSTEM,
+                                summary = "Video frame send error: ${e.message}",
+                                isError = true
+                            )
+                        }
+                    }
+                }
+            }
 
             val encoder = encoderFactory(width, height, fps)
             activeEncoder = encoder
@@ -92,7 +171,15 @@ class VideoStreamingManagerImpl(
                         width = width,
                         height = height,
                         fps = fps,
-                        scope = scope
+                        scope = scope,
+                        onError = { errMsg ->
+                            logRepository.log(
+                                direction = LogDirection.INTERNAL,
+                                protocol = ProtocolType.SYSTEM,
+                                summary = "TestPatternRenderer Error: $errMsg",
+                                isError = true
+                            )
+                        }
                     )
                 activeRenderer = renderer
                 renderer.start()
@@ -119,68 +206,26 @@ class VideoStreamingManagerImpl(
 
     private fun onH264FrameEncoded(frameData: ByteArray, width: Int, height: Int) {
         if (!_isStreaming.value) return
-
-        // Drop incoming frame if previous frame write is still in flight (single-flight backpressure)
-        if (!isTransmittingFrame.compareAndSet(false, true)) {
-            return
-        }
-
-        // 1. Wrap in WebLink FillRectangleCommand (ID 1)
-        val fillRectangle = WebLinkCommand.FillRectangle(
-            width = width,
-            height = height,
-            encodingType = 2, // H.264
-            appId = 0,
-            frameData = frameData
-        )
-        val webLinkBytes = WebLinkCodec.encode(fillRectangle)
-
-        // 2. Wrap in MTP Packet(s) targeting Video Channel (Port 12346), fragmented if > 16,284B
-        val mtpPackets = MTPCodec.wrapPayloadFragmented(
-            payload = webLinkBytes,
-            srcPort = MTPPacket.PORT_VIDEO_CHANNEL,
-            dstPort = MTPPacket.PORT_VIDEO_CHANNEL
-        )
-
-        // 3. Transmit via UsbAccessoryManager
-        scope.launch {
-            try {
-                if (_isStreaming.value) {
-                    var allSuccess = true
-                    for (packet in mtpPackets) {
-                        val success = usbAccessoryManager.send(packet)
-                        if (!success) {
-                            allSuccess = false
-                            break
-                        }
-                    }
-                    if (allSuccess) {
-                        _framesSent.value++
-                        _bytesSent.value += webLinkBytes.size
-                        framesInCurrentSecond.incrementAndGet()
-                    } else {
-                        logRepository.log(
-                            direction = LogDirection.INTERNAL,
-                            protocol = ProtocolType.SYSTEM,
-                            summary = "USB write failed during video streaming; stopping stream",
-                            isError = true
-                        )
-                        stopStreaming()
-                    }
-                }
-            } finally {
-                isTransmittingFrame.set(false)
-            }
-        }
+        frameChannel?.trySend(EncodedFrame(frameData, width, height))
     }
 
     private fun startFpsCounter() {
         fpsCounterJob?.cancel()
         fpsCounterJob = scope.launch {
+            var seconds = 0
             while (isActive) {
                 delay(1000)
                 val currentCount = framesInCurrentSecond.getAndSet(0)
                 _fps.value = currentCount.toInt()
+                seconds++
+                if (seconds % 5 == 0 && _isStreaming.value) {
+                    val kbSent = _bytesSent.value / 1024
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.SYSTEM,
+                        summary = "Video Stream Heartbeat: ${_fps.value} fps | ${_framesSent.value} total frames | ${kbSent} KB"
+                    )
+                }
             }
         }
     }
@@ -189,7 +234,10 @@ class VideoStreamingManagerImpl(
         if (!_isStreaming.value && activeEncoder == null) return
 
         _isStreaming.value = false
-        isTransmittingFrame.set(false)
+        frameSenderJob?.cancel()
+        frameSenderJob = null
+        frameChannel?.close()
+        frameChannel = null
         fpsCounterJob?.cancel()
         fpsCounterJob = null
         _fps.value = 0
