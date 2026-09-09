@@ -2,12 +2,12 @@
 
 ## 1. Overview & Vision
 
-**Pioneer AppRadio RE** is a modern, open-source Android implementation of Pioneer's proprietary car stereo accessory protocol (AAM2 / AppRadio Mode 2). 
+**Pioneer AppRadio RE** is a modern, open-source Android implementation of Pioneer's proprietary car stereo accessory protocol (AAM2 / AppRadio Mode 2 / WebLink). 
 
 The primary goals of this project are:
-1. **Reverse Engineer & Modernize**: Completely replace legacy 32-bit closed-source native libraries (`libPFormat.so` and `libWebLinkServerLib.so`) with clean, fast, memory-safe pure Kotlin implementations compatible with modern 64-bit Android 14/15 devices.
-2. **Real-time Protocol Inspection**: Provide an in-app live sniffer that displays raw and parsed USB communication between phone and car stereo, enabling on-hardware debugging and log export via Android ShareSheet.
-3. **Display Mirroring via Android VirtualDisplay**: Stream the phone screen or virtual secondary display to Pioneer head units (e.g. SPH-DA120, SPH-DA210, AVH series) with full two-way touch input and steering wheel remote control integration.
+1. **Reverse Engineer & Modernize**: Completely replace legacy 32-bit closed-source native libraries (`libPFormat.so`, `libWebLinkServerLib.so`, `libMCS_MTP.so`) with clean, fast, memory-safe pure Kotlin implementations compatible with modern 64-bit Android 14/15 devices.
+2. **Real-time Protocol Inspection**: Provide an in-app live sniffer that displays raw and parsed USB communication between phone and car stereo across both MTP virtual ports (12346 Video and 12347 Control), enabling on-hardware debugging and log export via Android ShareSheet.
+3. **Display Mirroring via Hardware MediaCodec**: Stream a smooth 30 FPS hardware-encoded H.264 video feed (`800x480`) to Pioneer head units (e.g. SPH-DA120, AVH-Z2090BT, Carrozzeria) with touch coordinate feedback and steering wheel remote control integration.
 
 ---
 
@@ -16,40 +16,67 @@ The primary goals of this project are:
 ```mermaid
 graph TD
     subgraph Pioneer Stereo Hardware
-        HU["Pioneer Head Unit<br/>(SPH-DA120 / AVH)"]
+        HU["Pioneer Head Unit<br/>(Dual-SoC: Linux CPU 0 + uITRON CPU 1)"]
     end
 
     subgraph Android OS Layer
-        AOA["Android Open Accessory (AOA)<br/>UsbManager & ParcelFileDescriptor"]
+        AOA["Android Open Accessory (AOA 2.0)<br/>UsbManager & ParcelFileDescriptor"]
+        MC["Hardware MediaCodec<br/>(video/avc Surface Encoder)"]
+    end
+
+    subgraph Core Transport & Multiplexer
+        UAM["UsbAccessoryManager & UsbDataSource<br/>(5000B Chunking + 512B ZLP Avoidance)"]
+        MTP["MTPCodec<br/>(0x1E ... 0x03 Multiplexer)"]
+    end
+
+    subgraph Virtual Channels
+        P12346["Port 12346: Video Channel<br/>(WebLink Commands & H.264 Video)"]
+        P12347["Port 12347: Control Channel<br/>(PFormat & SAC Commands)"]
     end
 
     subgraph Core Protocol Stack
+        WL["WebLinkCodec<br/>('WL' 8B Header, Little-Endian)"]
         PF["PFormatCodec<br/>(STX 0x9F 0x02 / ETX 0x9F 0x03 Framing)"]
         SAC["SACCodec<br/>(Big-Endian Pioneer Command Engine)"]
-        WL["WebLinkCodec<br/>(Little-Endian 'WL' Header Engine)"]
     end
 
-    subgraph Core Hardware & Orchestration
-        UAM["UsbAccessoryManager<br/>(AOA Discovery & I/O Coroutines)"]
-        HSM["HandshakeStateMachine<br/>(6-Step RunableRetry Handshake)"]
+    subgraph Hardware Video Pipeline
+        TPR["TestPatternRenderer<br/>(EGL 1.4 + GLES20 Surface Canvas)"]
+        H264["H264VideoEncoder<br/>(Surface -> SPS/PPS/IDR NALUs)"]
+        VSM["VideoStreamingManager<br/>(Non-blocking Conflated Channel)"]
+    end
+
+    subgraph Orchestration & Diagnostics
+        HSM["HandshakeStateMachine<br/>(Dual-Port Handshake, 5s Heartbeat)"]
         LR["LogRepository<br/>(Circular Buffer & FileProvider Export)"]
     end
 
-    subgraph MVI Presentation & UI Layer
+    subgraph MVI Presentation Layer
         VM["LiveLogViewModel<br/>(StateFlow, Channel Events, Filters)"]
         UI["LiveLogScreen<br/>(Jetpack Compose M3 UI)"]
         Share["Android ShareSheet<br/>(.txt Export via FileProvider)"]
     end
 
-    HU <==> |USB Cable (AOA Mode)| AOA
+    HU <==> |USB Cable (AOA 2.0)| AOA
     AOA <==> |Raw Byte Stream| UAM
-    UAM <==> PF
+    UAM <==> MTP
+    MTP <==> P12346
+    MTP <==> P12347
+    P12346 <==> WL
+    P12347 <==> PF
     PF <==> SAC
-    UAM <==> WL
     SAC <==> HSM
-    UAM -.-> |Packet Logs| LR
-    SAC -.-> |Packet Logs| LR
-    WL -.-> |Packet Logs| LR
+    WL <==> HSM
+
+    TPR --> |EGL Surface Frames| MC
+    MC --> H264
+    H264 --> VSM
+    VSM --> |FillRectangle Packets| P12346
+
+    UAM -.-> |Raw Packet Logs| LR
+    MTP -.-> |MTP Packet Logs| LR
+    SAC -.-> |SAC Packet Logs| LR
+    WL -.-> |WebLink Logs| LR
     HSM -.-> |Status & Specs| VM
     LR -.-> |StateFlow Logs| VM
     VM <==> UI
@@ -61,36 +88,41 @@ graph TD
 ## 3. Layer Breakdown
 
 ### 3.1 USB & Transport Layer (`core.usb`)
-- **`UsbAccessoryManager`**:
-  - Manages Android's `UsbManager` and `UsbAccessory` APIs.
-  - Dynamically registers for `ACTION_USB_ACCESSORY_ATTACHED` and `ACTION_USB_ACCESSORY_DETACHED`.
-  - Handles USB accessory permission requests (`PendingIntent`) with `RECEIVER_NOT_EXPORTED` on Android 14+.
-  - Manages the non-blocking background I/O coroutines (`Dispatchers.IO`) reading from `FileInputStream` and writing to `FileOutputStream`.
-  - Exposes reactive `connectionState: StateFlow<UsbConnectionState>` and `incomingBytes: SharedFlow<ByteArray>`.
+- **`UsbDataSource`**:
+  - Implements 5,000-byte chunking matching Pioneer's `UsbAccessoryLayer.writeDataInternal()`.
+  - Implements `% 512 == 0 -> -257` ZLP stall prevention.
+  - Implements lock acquisition timeout protection (`withTimeoutOrNull(2500L)`) around `writeMutex.withLock` to guarantee that streaming video bursts cannot starve control packets (`AuthBegin`, `AuthEnd`, heartbeats).
+- **`MTPCodec`**:
+  - Multiplexes Port 12346 (Video/WebLink) and Port 12347 (Control/SAC).
+  - Handles 20-byte SYN/ACK connection packets.
+  - Enforces safe 16,284-byte payload fragmentation to prevent MTP buffer overruns.
 
-- **`HandshakeStateMachine`**:
-  - Encapsulates the complete 6-step state machine reverse-engineered from Pioneer's legacy `RunableRetry.java`.
-  - Progresses through:
-    1. Auth Begin $\rightarrow$ Auth Response $\rightarrow$ Auth End.
-    2. Kind 4 (Start App Accessory).
-    3. Kind 5 (Start Accessory Info).
-    4. Kind 2 (Product Specs: Model ID, Multi-touch pointer count, GPS, Remote Control).
-    5. Kind 1 (Display Specs: Resolution e.g. 800x480).
-    6. Kind 3 (Accessory Status: Parking Brake, HDMI connection).
-    7. Kind 6 (End Accessory Info).
-    8. Standby: Video Output Request/Reply $\rightarrow$ 5s Status Query Heartbeats.
-  - Features an offline **Simulation Engine** allowing developers to simulate the entire handshake and touch events without car hardware.
+### 3.2 Handshake Orchestration (`core.usb.HandshakeStateMachine`)
+- **WebLink Channel Synchronization (Port 12346)**:
+  - Responds to `SetCurrentApp` with `"aam2serverapp://"`.
+  - Echoes `SyncSessionTime` using monotonic system uptime (`SystemClock.uptimeMillis()`).
+  - Confirms `VideoConfig` (`800x480 @ 30fps`).
+- **SAC Authentication Sequence (Port 12347)**:
+  - 1000ms delay after Port 12347 ACK before transmitting `AuthBegin`.
+  - Maximum 3 retries (`attempt <= 3`) with 3000ms intervals matching `AccessoryAuthor`.
+  - Validates `AuthResponse` accessory types (`0x02`, `0x03`, `0x08`).
+  - Sends `AuthEnd` with `majorVersion = min(3, mMachineMajorVer)` and `minorVersion = 1`.
+  - Dispatches full post-auth exchange (`StartAppAcc` $\rightarrow$ `StartAccessoryInfo` $\rightarrow$ `RequestSpec` $\rightarrow$ `DisplaySpec` $\rightarrow$ `AccessoryStatus` $\rightarrow$ `EndAccessoryInfo` $\rightarrow$ `EndAppAcc`).
+  - Sends periodic `SmartPhoneStatus` (Opcode 99) heartbeat every 5000ms while authenticated to satisfy the stereo's 15-second inactivity watchdog.
 
-### 3.2 Protocol Codec Layer (`core.protocol`)
-Pure Kotlin implementation adhering to strict endianness and framing standards:
-- **`PFormatCodec`**: Demarcates stream boundaries using `0x9F 0x02` (STX) and `0x9F 0x03` (ETX), handles byte-stuffing (`0x9F` escaped as `0x9F 0x9F`), and computes rolling XOR checksums.
-- **`SACCodec` / `SACCommand`**: Formats all Pioneer Smartphone-to-Accessory (S2A) and Accessory-to-Smartphone (A2S) commands using **Big-Endian (Network Byte Order)**.
-- **`WebLinkCodec` / `WebLinkCommand`**: Formats and parses WebLink video, session time sync, and touch coordinates using **Little-Endian** byte order prefixed by 8-byte `'WL'` (`0x57 0x4C`) headers.
-
-### 3.3 Logging Subsystem (`core.logging`)
-- **`LogEntry`**: Immutable domain model capturing timestamp, direction (`◄ RX`, `► TX`, `● SYS`), protocol tag, summary, decoded fields, and raw hex string.
-- **`LogRepository`**: Thread-safe circular buffer (2,000 capacity) providing real-time `StateFlow<List<LogEntry>>`.
-- **`FileProvider` Export**: Formats logs into an ASCII report and provides a secure `content://` URI for instant sharing via Android's ShareSheet.
+### 3.3 Hardware Video Pipeline (`core.video`)
+- **`TestPatternRenderer`**:
+  - EGL 1.4 hardware renderer drawing a 30 FPS automotive test canvas with millisecond clock, frame counter, corner crosshairs, and animated orb onto the `MediaCodec` input surface.
+  - Bulletproof texture upload with `GL_UNPACK_ALIGNMENT = 4` and automatic fallback from `texSubImage2D` to `texImage2D`.
+  - Direct error callbacks to `logRepository`.
+- **`H264VideoEncoder`**:
+  - Direct hardware encoding via `MediaCodec` (`video/avc`) at `800x480 @ 30fps`.
+  - CSD parameter extraction (`00 00 00 01 67` SPS, `00 00 00 01 68` PPS) prepended to keyframes.
+  - Isolated callback dispatch protecting the drain loop.
+- **`VideoStreamingManager`**:
+  - Non-blocking `Channel<EncodedFrame>(capacity = Channel.CONFLATED)` pipeline and dedicated sender coroutine.
+  - Wraps frames into WebLink `FillRectangleCommand` (ID 1).
+  - Emits 5-second periodic video heartbeat logging (`"Video Stream Heartbeat: X fps | Y total frames | Z KB"`).
 
 ### 3.4 Presentation Layer (`feature.livelog`)
 - **Architecture**: Strict MVI (Model-View-Intent).
@@ -98,18 +130,3 @@ Pure Kotlin implementation adhering to strict endianness and framing standards:
 - **Action**: Sealed interface representing all user intents (`LiveLogAction`).
 - **Event**: Sealed interface representing one-time side effects (`LiveLogEvent`), observed lifecycle-safely with `ObserveAsEvents`.
 - **Root/Screen Split**: `LiveLogRoot` handles Koin ViewModel injection and event listening, while `LiveLogScreen` is a pure composable receiving only `State` and `onAction`.
-
-### 3.5 Dependency Injection (`di`)
-- Configured with **Koin 4.0.2**.
-- All dependencies are singletons or scoped ViewModels provided via clean, explicit factory declarations in `AppModule.kt`.
-- Root application class `AppRadioApp` initializes Koin on app launch.
-
----
-
-## 4. Endianness & Data Flow Standards
-
-| Protocol Layer | Byte Order | Delimiters / Headers | Payload Format |
-|---|---|---|---|
-| **PFormat Frame** | Big-Endian | Start: `0x9F 0x02`<br/>End: `0x9F 0x03` | Escaped Command ID (1B) + Escaped Body + Escaped XOR Checksum (1B) |
-| **SAC Commands** | Big-Endian (MSB first) | None (inside PFormat) | 1B Subtype + Big-Endian Fields (Shorts/Ints) |
-| **WebLink Packets** | Little-Endian (LSB first) | 8-byte Header (`'W'`, `'L'`, 2B Command ID, 4B Length) | Little-Endian Fields (Ints, Longs, Floats) |

@@ -32,19 +32,20 @@ The original Pioneer companion application was abandoned years ago:
   - Connects to Pioneer stereos over physical USB AOA matching Pioneer's internal `ProtocolDispatcherImpl` and `ExtBaseService` state machine.
   - Automatically acknowledges Video Channel (Port 12346) and Control Channel (Port 12347) with compliant MTP frames (`isLast = false`).
   - Waits the official 1000ms delay after Port 12347 establishment before transmitting `AuthBegin`, eliminating premature packet drops.
-  - Aligns `AuthBegin` retries with Pioneer's `AccessoryAuthor` (3000ms interval, no redundant SYN/ACK packets injected during retry).
+  - Aligns `AuthBegin` retries with Pioneer's `AccessoryAuthor` (3000ms interval, max 3 attempts).
   - Debounces duplicate SYN packets without stalling authentication.
   - Includes AppRadio Mode+ status support: immediately answers `RequestPhoneStatus` (Opcode 0x62) with `SmartPhoneStatus` (Opcode 0x63), preventing head unit "Loading..." freezes.
-  - Synchronizes session timestamps and confirms video parameters (`800x480 @ 240 DPI, H.264 @ 8 Mbps`).
-  - Automatically sends `SetCurrentAppCommand("wlhome_1.0://")` and transitions straight to video streaming.
+  - Synchronizes session timestamps using monotonic uptime (`SystemClock.uptimeMillis()`) and confirms video parameters (`800x480 @ 240 DPI, H.264 @ 30fps`).
+  - Automatically sends `SetCurrentAppCommand("aam2serverapp://")` and transitions straight to video streaming.
 
-- **🎥 Hardware H.264 Video Pipeline & Auto-Streaming (Deadlock Resolution)**:
-  - Automatically launches video streaming immediately upon `VideoConfig` confirmation, matching `WLServerConnection.onVideoConfigurationCompleted()`. This satisfies the head unit's video decoder subsystem on Port 12346 and unlocks the stereo control subsystem to immediately return `AuthResponse (result=8)` on Port 12347, eliminating circular auth deadlocks.
-  - Direct hardware encoding via `MediaCodec` (`video/avc`) at `800x480 @ 30 FPS` and `8 Mbps`.
-  - Zero-copy surface rendering loop using `COLOR_FormatSurface`.
-  - Built-in 30 FPS automotive test pattern renderer with real-time millisecond clock (`HH:mm:ss.SSS`), monospaced frame counter, corner calibration crosshairs, and animated bouncing orb for visual confirmation of smooth 30 FPS streaming.
+- **🎥 Hardware H.264 Video Pipeline & GStreamer Preroll Continuity**:
+  - Automatically launches video streaming immediately upon `VideoConfig` confirmation, matching `WLServerConnection.onVideoConfigurationCompleted()`.
+  - Continuous 30 FPS H.264 frame transmission satisfies the head unit's GStreamer video decoder preroll (`omx_videosink -> GST_STATE_PLAYING`), prompting Linux to assert `wlcReqDecode(1)` across `/dev/isc` and unlocking the stereo's uITRON MCU to immediately return `AuthResponse (accessoryType=8)` on Port 12347.
+  - Dedicated non-blocking `Channel<EncodedFrame>(capacity = Channel.CONFLATED)` pipeline prevents frame drops and eliminates USB write mutex starvation.
+  - Direct hardware encoding via `MediaCodec` (`video/avc`) at `800x480 @ 30 FPS` and `2 Mbps`.
+  - Built-in 30 FPS automotive test pattern renderer with real-time millisecond clock (`HH:mm:ss.SSS`), monospaced frame counter, corner calibration crosshairs, and animated bouncing orb with automatic texture allocation fallbacks.
   - Automatic SPS/PPS parameter set extraction and keyframe insertion.
-  - Packaging of H.264 NAL units into WebLink `FillRectangleCommand` (ID 1) packets routed through MTP Video Channel (Port 12346).
+  - Packaging of H.264 NAL units into WebLink `FillRectangleCommand` (ID 1) packets routed through MTP Video Channel (Port 12346) with 16,284B fragmentation protection.
 
 - **🔍 Live Protocol Diagnostic Inspector**:
   - Real-time, zero-blind-spot packet sniffer capturing every raw byte transmitted over USB.

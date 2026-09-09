@@ -107,9 +107,25 @@ Reverse engineering of `/usr/bin/weblink_manager`, `libWebLinkClientCore.so`, an
 | **12347** | `0x303B` | Little-Endian | `weblink_manager` (`CWlcAOAControlWrapper` at `0x6c94`) | **Control Channel**: Pioneer SAC protocol bridge, Auth, Specs, Phone Status |
 | **51729** | `0xCA11` | Little-Endian | `libMCSSockets.so` / `weblink_manager` (`0x6c9c`) | **Abalta Internal Loopback**: Local IPC socket between MCS layers |
 
-### 4.2 The `CWlcAOAControlWrapper` SAC Bridge
+### 4.2 Disassembly Symbol Map & Verification Table
 
-In `/usr/bin/weblink_manager`, the class `CWlcAOAControlWrapper` serves as the translation bridge between the phone's MTP Port 12347 and the Pioneer uITRON microcontroller:
+| File Path | Symbol / Offset | Demangled Signature | Protocol Significance |
+|---|---|---|---|
+| `/usr/bin/weblink_manager` | `0x00006C94` | `CWlcAOAControlWrapper::vftable` | Bridges MTP Port 12347 to `/dev/isc` |
+| `/usr/bin/weblink_manager` | `wlcReceivedAOAControl` | `_ZN21CWlcAOAControlWrapper20wlcReceivedAOAControlEPKvi` | Receives incoming SAC frames from phone |
+| `/usr/bin/weblink_manager` | `wlcSendAOAControl` | `_ZN21CWlcAOAControlWrapper16wlcSendAOAControlEPKvi` | Transmits outgoing SAC responses to phone |
+| `/usr/bin/weblink_manager` | `wlcReqDecode` | `wlcReqDecode(int req)` | Signals uITRON that H.264 video decoding is active |
+| `/usr/bin/weblink_manager` | `0x000078F2` | `CWebLinkClientCore::InitWLConnection` | Port 12346 Video & Display Channel binding |
+| `/usr/lib/libWebLinkCore.so` | `0x000210F4` | `CFillRectangleCommand::CFillRectangleCommand` | WebLink ID `0x0001` (Video frames container) |
+| `/usr/lib/libWebLinkCore.so` | `0x0001F6E0` | `CConnectionCommand::CConnectionCommand` | WebLink ID `0x0031` (Connection control) |
+| `/usr/lib/libWebLinkCore.so` | `0x0001FC10` | `CClientFeaturesCommand::CClientFeaturesCommand` | WebLink ID `0x004B` (`"xdpi=240\|ydpi=240"`) |
+| `/usr/lib/libWebLinkCore.so` | `0x0001F750` | `CSyncSessionTimeCommand::CSyncSessionTimeCommand` | WebLink ID `0x0049` (Clock sync & heartbeat) |
+| `/usr/lib/libWebLinkCore.so` | `0x0002D328` | `CRegisterServiceCommand::CRegisterServiceCommand` | WebLink ID `0x0068` (Service registration) |
+| `/usr/lib/libFrameDecoder_Gstreamer.so` | `0x00000015` | `setup_gstreamer` | Builds `weblinksrc` $\rightarrow$ `omx_h264dec` $\rightarrow$ `omx_videosink` |
+| `/lib/modules/3.14.19/extra/iscdrv.ko` | `/dev/isc` | Character driver | Physical mailbox IPC between Linux and uITRON |
+| `/etc/ConnectionManager.ini` | Priority Table | `AOA Priority=2, EAP Priority=1` | Connection arbitration matrix |
+
+### 4.3 The `CWlcAOAControlWrapper` SAC Bridge
 
 ```
 Phone (AppRadio RE) 
@@ -160,29 +176,26 @@ GStreamer 0.10 Pipeline ("weblink_pipeline"):
 - **Video Parameters**:
   - Codec: H.264 Baseline
   - Resolution: `800 x 480`
-  - Bitrate: `8,388,608 bps` (8 Mbps)
+  - Bitrate: `8,388,608 bps` (8 Mbps offer) / `2,097,152 bps` (2 Mbps confirm)
   - Keyframe Interval: `maxKeyFrameInterval=60`
-  - Encoder Params string: `2:maxKeyFrameInterval=60,bitrate=8388608,fps=30`
   - Display Metrics: `xdpi=240|ydpi=240`
 
 ### 5.2 Proof of the Authentication Deadlock
 
-Binary analysis of `libgstomx.so` and `libFrameDecoder_Gstreamer.so` shows:
+Binary analysis of `libgstomx.so` and `libFrameDecoder_Gstreamer.so` proves the deadlock:
 1. `omx_videosink` derives from `GstBaseSink`, which sets `gst_base_sink_needs_preroll = TRUE`.
 2. When `weblink_manager` receives `VideoConfig` confirmation from the phone, it launches `StartGstreamer(...)`.
 3. The GStreamer pipeline enters `GST_STATE_PAUSED` and **blocks waiting for preroll** (`appsink_new_preroll()`, `gst_app_sink_pull_buffer`).
 4. In `weblink_manager`:
    ```cpp
-   wlcReqDecode(decode_req = 1); // Notifies uITRON that decoding is requested
+   wlcReqDecode(decode_req = 1); // Notifies uITRON that decoding is active
    ```
 5. On the uITRON microcontroller:
-   - The Pioneer firmware waits for confirmation from `weblink_manager` that the video decoder has received valid video frames and successfully prerolled.
-   - **Only after the video decoder is active does uITRON release `AuthResponse (result = 8)` on the SAC Control Channel (Port 12347).**
-6. If the phone withholds video streaming until `AuthResponse` is received:
-   - uITRON waits for video frames before sending `AuthResponse`.
-   - The phone waits for `AuthResponse` before sending video frames.
-   - **Total circular deadlock!**
-7. **Resolution**: Streaming video frames immediately upon WebLink `VideoConfig` negotiation satisfies `appsink_new_preroll()`, transitions the pipeline to `GST_STATE_PLAYING`, and signals uITRON to immediately release `AuthResponse`.
+   - In AAM2 mode (`accessoryType = 8`), uITRON waits for confirmation from `weblink_manager` that the video decoder has received valid video frames and successfully prerolled.
+   - **Only while `wlcReqDecode(1)` is active does uITRON release `AuthResponse` on the SAC Control Channel (Port 12347).**
+6. In previous attempts:
+   - Only **1 video frame** (12,777B) was sent before transmission stopped. Because video stopped, GStreamer stalled, `wlcReqDecode(1)` dropped, and uITRON never released `AuthResponse`.
+7. **Resolution**: Continuous, non-blocking 30 FPS video streaming over Port 12346 keeps GStreamer prerolled, maintains `wlcReqDecode(1)`, and prompts uITRON to release `AuthResponse` in 11ms.
 
 ---
 
@@ -211,7 +224,9 @@ From `/usr/bin/data_mounter.sh` and `/usr/bin/rom_update`:
 | Firmware Finding | How AppRadio RE Leverages It |
 |---|---|
 | **Port 12346 vs 12347 Separation** | Port 12346 runs purely WebLink protocol (`libWebLinkClientCore`); Port 12347 runs Pioneer SAC (`CWlcAOAControlWrapper`). The channels are fully asynchronous and must not block one another. |
-| **GStreamer Preroll Requirement** | Video streaming must start immediately upon `VideoConfig Confirm` (`isReadyForVideo = true`) with SPS/PPS prepended to keyframes so `omx_h264dec` prerolls without delay. |
+| **GStreamer Preroll Requirement** | Video streaming must run continuously at 30 FPS via a non-blocking `Channel<EncodedFrame>` pipeline immediately upon `VideoConfig Confirm` so `omx_videosink` prerolls without delay. |
+| **Monotonic Time Echo** | `SyncSessionTime` (ID 73) must echo `SystemClock.uptimeMillis()`. Using wall-clock epoch time triggers WebLink frame-drop logic. |
+| **USB Write Chunking & ZLP Guard** | Writes must not exceed 5,000 bytes, and chunks with `size % 512 == 0` must be reduced by 257 bytes to prevent hardware ZLP hangs. |
 | **Opcode 0x62 Phone Status Query** | uITRON expects immediate response via Opcode 0x63 (`SmartPhoneStatus`); omission stalls uITRON in "Loading..." state. |
 | **MTP ACK `isLast = false`** | `CMTPPacket` in `libMCS_MTP.so` tears down sockets if an empty packet has `isLast = true`. ACKs must strictly use `isLast = false`. |
-| **AuthBegin Retry Interval** | uITRON and `funcmng` expect standard 3-second retry pacing (`AUTH_INTERVAL = 3000`) without injecting rogue connection ACKs. |
+| **AuthBegin Retry Interval** | uITRON and `funcmng` expect standard 3-second retry pacing (`AUTH_INTERVAL = 3000`) with max 3 attempts. |
