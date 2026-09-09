@@ -31,6 +31,7 @@
 23. [New App Clean Architecture Design](#23-new-app-clean-architecture-design)
 24. [Phase 1: Live Log Skeleton App Implementation Plan](#24-phase-1-live-log-skeleton-app-implementation-plan)
 25. [Implementation Status & Completed Milestones](#25-implementation-status--completed-milestones)
+26. [Head Unit Firmware (RootFS) Architecture & Binary Analysis](#26-head-unit-firmware-rootfs-architecture--binary-analysis)
 
 ---
 
@@ -1079,5 +1080,27 @@ Step 4: Jetpack Compose Diagnostic UI
 
 ---
 
-> **Document Status**: Live, updated with Phase 2.5 Pioneer AVH-Z2090BT hardware integration, dual-channel auth deadlock resolution via `WLServerConnection.onVideoConfigurationCompleted()`, and 52 passing unit tests. Ready for in-vehicle testing.
+## 26. Head Unit Firmware (RootFS) Architecture & Binary Analysis
+
+Reverse engineering of the extracted head unit update filesystem (`decompiledApkFiles/rootfs`) provides complete hardware verification of the car stereo's internal architecture:
+
+### 26.1 Dual-CPU / Dual-OS Architecture
+- **CPU 0 (Application Processor)**: Panasonic Semiconductor Solutions "Gerda" (MN2WS series) ARMv7-A running Embedded Linux (Kernel 3.14.19 / Buildroot 2014.11).
+  - Handles USB AOA host stack (`funcmng`), WebLink (`weblink_manager`), CarPlay (`airplayclient`), Android Auto (`aap_manager`), and hardware video decoding (`omx_h264dec`).
+- **CPU 1 (Real-Time MCU)**: Automotive microcontroller running **uITRON 4.0 RTOS**.
+  - Handles vehicle CAN bus, parking brake, reverse signal, physical hardware buttons, audio DSP, and Pioneer SAC protocol processing.
+- **Inter-CPU Bridge (ISC)**: Shared physical RAM with mailbox interrupts (`iscdrv.ko`, `/dev/isc`, `libisc.so`, `libcom.so` `CInterCpuCom`). All SAC packets received on USB are relayed across ISC to uITRON (`wlcReceivedAOAControl`).
+
+### 26.2 Internal Port Allocations & Hardware Video Pipeline
+- **Port 12346 (`0x303A`)**: Handled by `libWebLinkClientCore.so` (`0x78f2`) as the dedicated WebLink Video & Display Channel.
+- **Port 12347 (`0x303B`)**: Bound in `weblink_manager` (`CWlcAOAControlWrapper` at `0x6c94`) as the Control Channel, bridging SAC commands across ISC to uITRON.
+- **GStreamer OpenMAX Pipeline**:
+  `appsrc (weblinksrc)` $\rightarrow$ `video/x-h264` $\rightarrow$ `omx_h264dec` $\rightarrow$ `video_convert` $\rightarrow$ `omx_videosink`
+  - Encoder requirements: `2:maxKeyFrameInterval=60,bitrate=8388608,fps=30` at `800x480 (xdpi=240|ydpi=240)`.
+  - **Preroll Proof**: `omx_videosink` blocks in `GST_STATE_PAUSED` until initial H.264 frames arrive (`gst_base_sink_needs_preroll = TRUE`). uITRON withholds `AuthResponse` until `weblink_manager` reports `wlcReqDecode` completion, confirming why immediate video streaming on `VideoConfig` is mandatory to avoid deadlock.
+
+---
+
+> **Document Status**: Live, updated with Phase 2.5 Pioneer AVH-Z2090BT hardware integration, rootfs firmware reverse-engineering, dual-channel auth deadlock resolution, and 52 passing unit tests. Ready for in-vehicle testing.
+
 
