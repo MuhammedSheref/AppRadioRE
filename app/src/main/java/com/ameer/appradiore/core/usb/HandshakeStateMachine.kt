@@ -151,13 +151,13 @@ class HandshakeStateMachineImpl(
                 _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
             }
 
-            // Retry loop matching Pioneer's AccessoryAuthor (AUTH_INTERVAL = 3000ms): up to 5 attempts
+            // Retry loop matching Pioneer's AccessoryAuthor (AUTH_INTERVAL = 3000ms, MAX_AUTH_COUNT = 3 attempts)
             var attempt = 1
-            while (isActive && attempt <= 5 && !isSacAuthenticated) {
+            while (isActive && attempt <= 3 && !isSacAuthenticated) {
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SYSTEM,
-                    summary = "Sending AuthBegin (Attempt $attempt of 5)..."
+                    summary = "Sending AuthBegin (Attempt $attempt of 3)..."
                 )
                 try {
                     sendSacCommand(SACCommand.AuthBegin)
@@ -179,7 +179,7 @@ class HandshakeStateMachineImpl(
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SYSTEM,
-                    summary = "No AuthResponse received after 5 attempts. Stereo may require returning to Home Menu or reconnecting.",
+                    summary = "No AuthResponse received after 3 attempts. Stereo may require returning to Home Menu or reconnecting.",
                     isError = true
                 )
             }
@@ -197,6 +197,7 @@ class HandshakeStateMachineImpl(
         heartbeatJob = null
         packetBuffer.reset()
         isMtpMode = true
+        controlChannelReady = false
         isSacAuthenticated = false
         stereoControlPort = MTPPacket.PORT_CONTROL_CHANNEL
         stereoAddress = MTPAddress.ANY_CONTROL
@@ -346,6 +347,7 @@ class HandshakeStateMachineImpl(
             }
 
             if (isControl && !isSacAuthenticated) {
+                controlChannelReady = true
                 // Cancel fallback timer since MTP control channel exists
                 fallbackJob?.cancel()
                 fallbackJob = null
@@ -431,8 +433,10 @@ class HandshakeStateMachineImpl(
                         summary = "Auth Succeeded! Code: ${sacCmd.result}, Stereo Version: ${sacCmd.majorVersion}.${sacCmd.minorVersion}"
                     )
                     _currentStep.value = HandshakeStep.STEP_0_AUTH_END
-                    // Send AuthEnd confirmation
-                    sendSacCommand(SACCommand.AuthEnd(isSuccess = true, majorVersion = sacCmd.majorVersion, minorVersion = sacCmd.minorVersion))
+                    // Send AuthEnd confirmation (Pioneer SmartPhonePFEventSender: majorVersion = min(3, mMachineMajorVer) if > 0 else 2, minorVersion = 1)
+                    val major = if (sacCmd.majorVersion > 0) minOf(3.toShort(), sacCmd.majorVersion) else 2.toShort()
+                    val minor = if (sacCmd.minorVersion > 0) sacCmd.minorVersion else 1.toShort()
+                    sendSacCommand(SACCommand.AuthEnd(isSuccess = true, majorVersion = major, minorVersion = minor))
 
                     // Step 1: StartAppAcc
                     _currentStep.value = HandshakeStep.STEP_1_START_APP_ACC
@@ -491,6 +495,7 @@ class HandshakeStateMachineImpl(
                     summary = "Stereo requested SmartPhoneStatus (type: 0x${String.format("%02X", sacCmd.statusType)}). Replying with SmartPhoneStatus..."
                 )
                 sendSacCommand(SACCommand.SmartPhoneStatus(statusType = sacCmd.statusType))
+                startHeartbeat()
             }
             is SACCommand.EndAccessoryInfoReply -> {
                 logRepository.log(
@@ -661,7 +666,11 @@ class HandshakeStateMachineImpl(
                 )
             }
             is WebLinkCommand.SyncSessionTime -> {
-                val serverTime = System.currentTimeMillis()
+                val serverTime = try {
+                    android.os.SystemClock.uptimeMillis()
+                } catch (_: Throwable) {
+                    System.currentTimeMillis()
+                }
                 val reply = WebLinkCommand.SyncSessionTime(
                     clientTime = cmd.clientTime,
                     serverTime = serverTime
@@ -790,10 +799,11 @@ class HandshakeStateMachineImpl(
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             while (isActive) {
-                delay(5000)
-                // Heartbeat packet / status query (SAC only)
-                if (_currentStep.value == HandshakeStep.CONNECTED_READY && !isMtpMode) {
-                    sendSacCommand(SACCommand.RequestAccessoryStatus)
+                delay(5000L)
+                // Pioneer ExtBaseService periodic heartbeat: SmartPhoneStatus (Opcode 99/0x63, Subtype 32/0x20)
+                // Sent every 5000ms to keep the stereo's 15-second AOA inactivity watchdog from timing out
+                if (isSacAuthenticated) {
+                    sendSacCommand(SACCommand.SmartPhoneStatus())
                 }
             }
         }

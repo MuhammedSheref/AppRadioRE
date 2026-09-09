@@ -169,12 +169,12 @@ sealed class SACCommand {
     // ==========================================
 
     data class AuthResponse(
-        val result: Byte,
+        val result: Byte, // accessoryType: 2 = AppRadio, 3 = MediaDEH, 8 = Linkwith AAM2
         val majorVersion: Short,
         val minorVersion: Short
     ) : SACCommand() {
         override val opcode: Byte = OP_A2S_AUTH
-        val isSuccess: Boolean get() = result.toInt() != 0 || majorVersion > 0
+        val isSuccess: Boolean get() = result.toInt() == 2 || result.toInt() == 3 || result.toInt() == 8 || result.toInt() != 0 || majorVersion > 0
     }
 
     data class StartAppAccReply(val result: Byte) : SACCommand() {
