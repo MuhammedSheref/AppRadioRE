@@ -113,7 +113,19 @@ class UsbDataSourceImpl(
                 summary = "TX Raw USB Chunk (${data.size} bytes)",
                 rawHex = hexPreview + suffix
             )
-            stream.write(data)
+            // USB write chunking matching UsbAccessoryLayer.writeDataInternal() from Pioneer OEM source:
+            // max 5000 bytes per chunk. If chunkSize % 512 == 0, reduce by 257 bytes to prevent USB ZLP stalls.
+            var offset = 0
+            var remaining = data.size
+            while (remaining > 0) {
+                var chunkSize = minOf(5000, remaining)
+                if (chunkSize % 512 == 0) {
+                    chunkSize -= 257
+                }
+                stream.write(data, offset, chunkSize)
+                offset += chunkSize
+                remaining -= chunkSize
+            }
             stream.flush()
             Result.Success(Unit)
         } catch (e: Exception) {
