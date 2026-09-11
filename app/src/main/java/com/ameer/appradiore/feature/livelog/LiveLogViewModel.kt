@@ -55,12 +55,6 @@ class LiveLogViewModel(
                 _state.update { it.copy(handshakeStep = step) }
                 if (step == HandshakeStep.DISCONNECTED || step == HandshakeStep.FAILED) {
                     videoStreamingManager.stopStreaming()
-                } else if (step == HandshakeStep.CONNECTED_READY) {
-                    if (!_state.value.isStreaming) {
-                        val width = if (_state.value.stereoSpecs.width > 0) _state.value.stereoSpecs.width else 800
-                        val height = if (_state.value.stereoSpecs.height > 0) _state.value.stereoSpecs.height else 480
-                        videoStreamingManager.startStreaming(width = width, height = height, fps = 30)
-                    }
                 }
             }
         }
@@ -70,9 +64,9 @@ class LiveLogViewModel(
             handshakeStateMachine.stereoSpecs.collect { specs ->
                 _state.update { it.copy(stereoSpecs = specs) }
                 if (specs.isReadyForVideo && !_state.value.isStreaming) {
-                    val width = if (specs.width > 0) specs.width else 800
-                    val height = if (specs.height > 0) specs.height else 480
-                    videoStreamingManager.startStreaming(width = width, height = height, fps = 30)
+                    val w = specs.width.takeIf { it in 320..1920 } ?: 800
+                    val h = specs.height.takeIf { it in 240..1080 } ?: 480
+                    videoStreamingManager.startStreaming(width = w, height = h, fps = 30)
                 }
             }
         }

@@ -76,9 +76,13 @@ class LiveLogViewModelTest {
 
         var streamingStarted = false
         var streamingStopped = false
+        var startedWidth = 0
+        var startedHeight = 0
 
         override fun startStreaming(width: Int, height: Int, fps: Int) {
             streamingStarted = true
+            startedWidth = width
+            startedHeight = height
             isStreaming.value = true
         }
 
@@ -233,14 +237,48 @@ class LiveLogViewModelTest {
     }
 
     @Test
-    fun testVideoStreamingStartsAutomaticallyOnVideoConfigReady() = runTest {
+    fun testVideoStreamingDoesNotStartPrematurelyOnStereoSpecsUpdate() = runTest {
         val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
 
         assertFalse(fakeVideoStreamingManager.streamingStarted)
 
+        // WebLink VideoConfig arrives with stereo resolution:
+        fakeStateMachine.stereoSpecs.value = StereoSpecs(width = 800, height = 480, dpi = 240)
+
+        // Video MUST remain idle during auth handshake
+        assertFalse(fakeVideoStreamingManager.streamingStarted)
+        assertFalse(viewModel.state.value.isStreaming)
+    }
+
+    @Test
+    fun testVideoStreamingDoesNotStartAutomaticallyOnConnectedReady() = runTest {
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
+
+        assertFalse(fakeVideoStreamingManager.streamingStarted)
+
+        fakeStateMachine.stereoSpecs.value = StereoSpecs(width = 800, height = 480)
+        fakeStateMachine.currentStep.value = HandshakeStep.CONNECTED_READY
+
+        // Streaming MUST remain deferred to prevent Pioneer USB bulk deadlocks
+        assertFalse(fakeVideoStreamingManager.streamingStarted)
+        assertFalse(viewModel.state.value.isStreaming)
+
+        // User can manually toggle streaming when ready
+        viewModel.onAction(LiveLogAction.OnToggleVideoStream(true))
+        assertTrue(fakeVideoStreamingManager.streamingStarted)
+    }
+
+    @Test
+    fun testVideoStreamingStartsWhenReadyForVideo() = runTest {
+        val viewModel = LiveLogViewModel(fakeContext, fakeUsb, fakeStateMachine, logRepository, fakeVideoStreamingManager)
+
+        assertFalse(fakeVideoStreamingManager.streamingStarted)
+
+        // When stereo unlocks display canvas (isReadyForVideo = true):
         fakeStateMachine.stereoSpecs.value = StereoSpecs(width = 800, height = 480, isReadyForVideo = true)
 
         assertTrue(fakeVideoStreamingManager.streamingStarted)
-        assertTrue(viewModel.state.value.isStreaming)
+        assertEquals(800, fakeVideoStreamingManager.startedWidth)
+        assertEquals(480, fakeVideoStreamingManager.startedHeight)
     }
 }
