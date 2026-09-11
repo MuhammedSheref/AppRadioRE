@@ -229,4 +229,76 @@ From `/usr/bin/data_mounter.sh` and `/usr/bin/rom_update`:
 | **USB Write Chunking & ZLP Guard** | Writes must not exceed 5,000 bytes, and chunks with `size % 512 == 0` must be reduced by 257 bytes to prevent hardware ZLP hangs. |
 | **Opcode 0x62 Phone Status Query** | uITRON expects immediate response via Opcode 0x63 (`SmartPhoneStatus`); omission stalls uITRON in "Loading..." state. |
 | **MTP ACK `isLast = false`** | `CMTPPacket` in `libMCS_MTP.so` tears down sockets if an empty packet has `isLast = true`. ACKs must strictly use `isLast = false`. |
-| **AuthBegin Retry Interval** | uITRON and `funcmng` expect standard 3-second retry pacing (`AUTH_INTERVAL = 3000`) with max 3 attempts. |
+| **AuthBegin Retry Interval** | uITRON and `funcmng` expect standard 3-second retry pacing (`AUTH_INTERVAL = 3000`) with extended 6 attempts during hotplug. |
+| **DisplaySpecInfo Dimension Parsing** | Bytes 1–4 are pixels ($800 \times 480$), bytes 5–8 are physical dimensions in 0.1 mm ($155.0 \times 87.0\text{ mm}$). Parsing physical dimensions as pixels crashes the hardware VPU. |
+| **Initial SYN Packet Caching** | Initial Port 12346/12347 SYNs sent before Android coroutines subscribe are retained via `replay = 16` buffer to prevent handshake drops. |
+
+---
+
+## 8. Empirical Hardware Validation & Head Unit Lifecycle Analysis
+
+Direct vehicle testing against physical Pioneer head units (AVH-Z series) and side-by-side comparison with the official Pioneer AppRadio Mode APK revealed critical operational characteristics in the firmware daemon lifecycle:
+
+### 8.1 Cold Boot vs. Hotplug Socket Lifecycle
+```mermaid
+stateDiagram-v2
+    [*] --> CarPoweredOff: Ignition OFF
+    CarPoweredOff --> CleanBoot: Phone Connected + Ignition ON (Cold Boot)
+    CleanBoot --> MtpSocketsListening: funcmng & weblink_manager start
+    MtpSocketsListening --> AuthSuccess: AuthBegin Attempt 1 (100% Reliable)
+
+    [*] --> CarRunning: Ignition ON / Stereo Active
+    CarRunning --> Disconnect: USB Cable Unplugged (Hotplug)
+    Disconnect --> HalfOpenSockets: libMCS_MTP loses physical endpoint without isLast=true
+    Disconnect --> UISourceReverted: uITRON switches AV source to Tuner / Home
+    HalfOpenSockets --> AuthHang: Phone Reconnected -> Auth Frames Ignored
+    UISourceReverted --> AuthHang
+    AuthHang --> ManualWakeup: User taps "Apps" / "AppRadio" on Pioneer Touchscreen
+    ManualWakeup --> AuthSuccess: weblink_manager resumed -> AuthResponse released
+```
+
+1. **Cold Boot (Clean Sockets)**:
+   - When the vehicle starts with the phone already attached, Linux CPU 0 and uITRON CPU 1 boot from cold power.
+   - `funcmng` binds `/dev/aoaACS` and launches `weblink_manager`.
+   - The virtual MTP multiplexer initializes fresh sockets on Ports 12346 and 12347 in clean `LISTEN` state.
+   - Handshake and SAC Authentication succeed on **Attempt 1 with zero retries**.
+
+2. **Hotplug / Unclean Disconnect (Half-Open Sockets & UI Demotion)**:
+   - When the cable is pulled while the stereo is running, Android cannot send a graceful MTP disconnect message (`SendCloseMtpMessage` / `isLast = true`).
+   - `weblink_manager` maintains virtual MTP sockets in a dangling/half-open state until internal inactivity watchdogs expire (15–30 seconds).
+   - Concurrently, uITRON detects loss of AOA, drops the Linux VPU video overlay plane, and switches the audio/video source to the Radio Tuner or Home Menu.
+   - In this state, `CWlcAOAControlWrapper` on `/dev/isc` enters an idle/background state, dropping incoming Port 12347 control frames.
+
+3. **OEM Pioneer AppRadio APK Validation**:
+   - Running the original, official Pioneer AppRadio Mode APK in this hotplug scenario exhibited the **identical failure mode**: the official app stalled at authentication and could not establish a connection without multiple replug cycles or head unit resets.
+   - This proves the hotplug hang is caused by the head unit's firmware socket and UI state machine, not a protocol defect in AppRadio RE.
+
+4. **Touchscreen Wake-Up**:
+   - Tapping the **"Apps"** or **"AppRadio"** source icon on the Pioneer touchscreen re-engages uITRON's AAM2 state machine, promotes `weblink_manager` out of background dormancy, and causes the stereo to immediately answer subsequent `AuthBegin` retries.
+
+### 8.2 Opcode 0x07 DisplaySpecInfo Breakdown & Black Screen Analysis
+When authentication succeeded in vehicle testing, a black screen was initially observed. Forensic analysis of the raw Opcode `0x07` byte stream decoded from `wlcSendAOAControl` revealed:
+
+```
+Raw Opcode 0x07 Hex Stream:
+00 03 20 01 E0 06 0E 03 66 00 01 ...
+│  └───────┘  └───────┘  │
+│    Width     Height    └─ Flags / Subtypes
+│    (Pixels)  (Pixels)
+└─ Subtype 0x00
+   
+Byte Layout:
+[00]       : Subtype = 0x00 (DisplaySpecInfo)
+[01 - 02]  : 0x0320 = 800  (Resolution Width in Pixels)
+[03 - 04]  : 0x01E0 = 480  (Resolution Height in Pixels)
+[05 - 06]  : 0x060E = 1550 (Physical Width: 155.0 mm in 0.1 mm units)
+[07 - 08]  : 0x0366 = 870  (Physical Height: 87.0 mm in 0.1 mm units)
+```
+
+- **Physical Dimension Calculation**:
+  - $155.0\text{ mm} \times 87.0\text{ mm}$ corresponds exactly to the active display area of a standard **7.0-inch 16:9 double-DIN automotive LCD panel**:
+    $$\sqrt{155.0^2 + 87.0^2} \approx 177.8\text{ mm} \approx 7.00\text{ inches}$$
+- **Black Screen Failure Mechanism**:
+  - Legacy code skipped the first 4 bytes and mistakenly read bytes 5–8 ($1550 \times 870$) as the pixel resolution.
+  - Feeding a 1550x870 video configuration to the head unit caused Panasonic Gerda's OpenMAX Bellagio decoder (`omx_h264dec` wrapping the Chips&Media CODA VPU) to fail buffer allocation, leaving the LCD overlay blank.
+  - Correcting the parser to extract $800 \times 480$ from bytes 1–4 and auto-starting continuous H.264 video streaming on `DisplaySpecInfo` resolves the black screen, presenting clean video output on the vehicle head unit.

@@ -156,10 +156,14 @@ All multibyte integers (Shorts, Ints) are transmitted in **Big-Endian (Network B
   - Byte 5: Remote Control Supported (`1` = Yes)
   - Byte 6: CAN Bus Connected (`1` = Yes)
 - **RequestDisplaySpec (TX)**: Opcode `0x06`, Payload: `[ 0x00 ]`
-- **DisplaySpecReply (RX)**: Opcode `0x07`, Subtype `0x00`:
-  - Bytes 1–4: Reserved (4B)
-  - Bytes 5–6: Width (Short Big-Endian: `800` $\rightarrow$ `0x03 0x20`)
-  - Bytes 7–8: Height (Short Big-Endian: `480` $\rightarrow$ `0x01 0xE0`)
+- **DisplaySpecReply (RX)**: Opcode `0x07`, Subtype `0x00` (13 bytes total payload):
+  - Byte 0: Subtype `0x00` (`DISPLAY_INFO`)
+  - Bytes 1–2: **Pixel Width** (Short Big-Endian: `800` $\rightarrow$ `0x03 0x20`)
+  - Bytes 3–4: **Pixel Height** (Short Big-Endian: `480` $\rightarrow$ `0x01 0xE0`)
+  - Bytes 5–6: **Physical Width** in tenths of a millimeter (Short Big-Endian: `1550` $\rightarrow$ `0x06 0x0E` = 155.0 mm for standard 7" double-DIN screen)
+  - Bytes 7–8: **Physical Height** in tenths of a millimeter (Short Big-Endian: `870` $\rightarrow$ `0x03 0x66` = 87.0 mm)
+  - Bytes 9–12: Pad / Reserved (`0xFF 0xFF 0xFF 0xFF`)
+  - *Critical Note*: Bytes 1–4 are pixel resolution ($800 \times 480$). Mistaking bytes 5–8 ($1550 \times 870$) for pixel dimensions will cause the phone's video encoder to emit an unsupported resolution that chokes the head unit's hardware H.264 decoder and yields a black screen.
 
 #### 4. Accessory Status (`Opcode 0x60` / `0x61`)
 - **RequestAccessoryStatus (TX)**: Opcode `0x60`, Payload: `[ 0x20, 0xFF ]`
@@ -251,3 +255,29 @@ The phone echoes with:
 5. In AAM2 mode (`accessoryType = 8`), uITRON's authentication state machine **withholds `AuthResponse`** until `wlcReqDecode(1)` is active.
 6. **The Deadlock**: If the phone sends only 1 video frame and pauses, or halts video transmission while waiting for `AuthResponse`, GStreamer stalls, `wlcReqDecode(1)` drops, and uITRON never sends `AuthResponse`.
 7. **The Solution**: The phone must run continuous, non-blocking 30 FPS video streaming over Port 12346. Satisfying GStreamer preroll causes uITRON to release `AuthResponse` within 11 milliseconds.
+
+---
+
+## 7. Empirical Hardware Findings: Cold Boot vs. Hotplug Reconnection
+
+Physical vehicle testing on Pioneer AVH head units (AVH-Z series) revealed a fundamental disparity between cold booting and hotplugging:
+
+### 7.1 The Cold Boot Advantage (100% Auth Success)
+- When the car and head unit are completely powered OFF (ignition OFF / stereo dark):
+  1. Phone is plugged into the USB port.
+  2. Ignition is switched ON, initiating a cold boot of Panasonic Gerda Linux and Renesas uITRON.
+  3. All IPC mailboxes, USB drivers, and MTP daemons start with zero accumulated state.
+  4. Both Port 12346 and Port 12347 sockets are clean, listening, and receive their ACKs immediately.
+  5. Authentication succeeds 100% of the time on the very first `AuthBegin` attempt.
+
+### 7.2 The Hotplug / "Stereo Already ON" Disconnect Behavior
+- When the car/stereo is ALREADY running, and the USB cable is unplugged and replugged:
+  1. **Half-Open MTP Socket State**: Because abrupt cable removal prevents Android from sending a graceful teardown packet (`isLast = true`), the head unit's MTP daemon (`u2nl` / `weblink_manager`) leaves the virtual sockets on Port 12346 and Port 12347 in a half-open state until a 15–30 second inactivity watchdog triggers.
+  2. **Head Unit UI State Transition**: On cable disconnect, the Pioneer head unit automatically exits AppRadio mode and reverts to the Tuner, Home menu, or last AV source. The AAM2 background service is placed into a dormant state, ignoring incoming `AuthBegin` control frames.
+  3. **Verification with Official Pioneer AppRadio APK**: Testing the official, original Pioneer AppRadio Mode application reveals the **identical failure mode**: hotplugging while the car is on fails authentication repeatedly until either the socket watchdog expires or repeated replug attempts reset the interface.
+
+### 7.3 Implemented Mitigations & User Workflow
+- **Replay Buffering (`replay = 16`)**: In `UsbDataSourceImpl`, initial USB chunks are buffered so early Port 12346/12347 SYNs sent before coroutine collection starts are never dropped.
+- **Proactive Dual-Port Connection ACKs**: Immediately upon USB connection, the app proactively transmits connection ACKs to both Port 12346 and Port 12347.
+- **Persistent Channel Pings**: Auth retry count is extended to 6 attempts, with Port 12347 connection pings sent prior to each `AuthBegin` retry.
+- **Head Unit Touchscreen Activation**: If hotplugged while the head unit is running, tapping the **"Apps"** or **"AppRadio"** source icon on the Pioneer touchscreen awakens the head unit's AAM2 service and immediately unblocks authentication.

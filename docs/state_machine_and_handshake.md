@@ -152,3 +152,60 @@ sequenceDiagram
 - **5-Second Heartbeat**: Phone transmits `SmartPhoneStatus` (Opcode 99 / `0x63`, Subtype 32 / `0x20`) every 5,000ms:
   `9F 02 63 20 00 00 00 00 00 00 [XOR] 9F 03`
   This keeps the connection permanently alive.
+
+---
+
+## 4. Empirical Hardware Behavior: Cold Boot vs. Hotplug Reconnection
+
+Empirical physical testing on vehicle head units (e.g. Pioneer AVH-Z2090BT / AppRadio Mode+ series) uncovered critical operational subtleties regarding power states, connection timing, and display resolution parsing:
+
+### 4.1 Cold Boot State (100% Authentication Reliability)
+- **Sequence**:
+  1. Car ignition is completely OFF (head unit unpowered, screens dark).
+  2. Phone is connected via USB.
+  3. Car ignition is switched ON (head unit cold boots).
+- **Head Unit State**:
+  - The Panasonic Gerda Linux kernel (CPU 0) and Renesas uITRON RTOS (CPU 1) boot synchronously.
+  - The Inter-System Communications (`/dev/isc`) driver and `funcmng` initialize with clean mailbox registers.
+  - `weblink_manager` binds fresh virtual MTP sockets for Port 12346 (Video) and Port 12347 (Control) in a clean `LISTEN` state.
+  - As soon as the phone presents AOA 2.0 descriptors, initial SYN packets are exchanged without friction.
+- **Outcome**: SAC Authentication succeeds on **Attempt 1 (100% success rate)**.
+
+### 4.2 Hotplug / Running Stereo State (Authentication Deadlock)
+- **Sequence**:
+  1. Car ignition is already ON; head unit is actively running.
+  2. Phone is unplugged and replugged, or plugged in after the head unit is already booted into the home screen / radio tuner.
+- **Root Causes**:
+  1. **Half-Open MTP Virtual Sockets**: Abrupt USB disconnect prevents Android from issuing an MTP close frame (`isLast = true`). The head unit's `libMCS_MTP.so` socket stack remains in a half-open / orphan state until internal socket timers (15–30 seconds) expire.
+  2. **Head Unit UI Source Demotion**: Upon USB disconnection, uITRON immediately unloads the mirroring display plane and reverts the AV source to Radio Tuner or Home Menu. The AAM2 background daemon enters a dormant state where incoming Port 12347 control frames are ignored.
+- **Verification with Official Pioneer AppRadio APK**:
+  - Testing with Pioneer's official, original AppRadio Mode APK confirmed **identical behavior**: hotplugging while the car is running results in the official app getting stuck at authentication, only succeeding after repeated replug cycles or waiting for head unit background daemon resets.
+  - This proves conclusively that the hotplug hang is an intrinsic characteristic of Pioneer's head unit daemon lifecycle, not a flaw in the AppRadio RE protocol parser.
+
+### 4.3 The Touchscreen Wake-Up Technique
+- When hotplugging an Android device into an already-running Pioneer stereo:
+  - Simply plugging in the phone will keep the connection waiting at SAC Auth.
+  - **Manual Intervention**: Tapping the **"Apps"** or **"AppRadio"** source icon on the Pioneer touchscreen forces uITRON to switch the AV source to WebLink/AAM2 and wakes up `weblink_manager` / `CWlcAOAControlWrapper`.
+  - Once tapped, the head unit immediately responds to the next `AuthBegin` retry.
+
+### 4.4 Black Screen After Auth Success: Resolution vs. Physical Screen Dimensions
+- In initial live tests, authentication succeeded, yet the head unit displayed a blank/black screen.
+- **Root Cause Analysis**:
+  - Stereo sends Opcode `0x07` (`DisplaySpecInfo`) in response to Opcode `0x06` `RequestDisplayInfo`:
+    `00 03 20 01 E0 06 0E 03 66 00 01 ...`
+  - **Bytes 1–4**: Resolution in pixels:
+    - Bytes 1–2: `0x0320` = **800 px width**
+    - Bytes 3–4: `0x01E0` = **480 px height**
+  - **Bytes 5–8**: Physical screen size in tenths of a millimeter (0.1 mm):
+    - Bytes 5–6: `0x060E` = **1550** ($155.0\text{ mm}$ width)
+    - Bytes 7–8: `0x0366` = **870** ($87.0\text{ mm}$ height)
+    - (A standard 7.0-inch 16:9 car double-DIN display measures exactly $155\text{ mm} \times 87\text{ mm}$).
+  - Legacy code skipped the first 4 bytes and misinterpreted the physical dimensions ($1550 \times 870$) as the pixel resolution, requesting an unsupported video format and causing the hardware VPU (`omx_h264dec`) to fail or display black.
+  - Parsing the true $800 \times 480$ pixel dimensions and feeding continuous 30 FPS H.264 video resolves the issue.
+
+### 4.5 Protocol Resilience Measures in AppRadio RE
+To maximize hotplug reliability without requiring car restarts:
+1. **Initial Packet Replay Buffer (`replay = 16`)**: `UsbDataSourceImpl` buffers early raw USB packets so SYN packets arriving during coroutine initialization are never lost.
+2. **Proactive Dual-Port Connection ACKs**: The phone proactively emits connection ACKs for both Port 12346 and Port 12347 immediately on USB connection.
+3. **Paced Auth Retries with Channel Pings**: Auth retries are expanded to 6 attempts with 3000ms backoff, prepended with Port 12347 MTP connection pings to clear half-open states in `libMCS_MTP.so`.
+4. **Immediate Video Pipeline Auto-Start**: On receipt of `VideoOutputRequest` / `DisplaySpecInfo`, the app automatically spins up the H.264 encoder stream at $800 \times 480$, ensuring GStreamer preroll remains satisfied.
