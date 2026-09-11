@@ -99,10 +99,25 @@ class VideoStreamingManagerImpl(
             val channel = Channel<EncodedFrame>(capacity = Channel.CONFLATED)
             frameChannel = channel
 
+            val minFrameIntervalMs = 1000L / fps
+            var lastFrameSendTime = 0L
+
             frameSenderJob = scope.launch(ioDispatcher) {
                 for (item in channel) {
                     if (!_isStreaming.value) break
                     try {
+                        if (lastFrameSendTime > 0L) {
+                            val now = try {
+                                android.os.SystemClock.uptimeMillis()
+                            } catch (_: Throwable) {
+                                System.currentTimeMillis()
+                            }
+                            val elapsed = now - lastFrameSendTime
+                            if (elapsed in 0 until minFrameIntervalMs) {
+                                delay(minFrameIntervalMs - elapsed)
+                            }
+                        }
+
                         // 1. Wrap in WebLink FillRectangleCommand (ID 1)
                         val fillRectangle = WebLinkCommand.FillRectangle(
                             width = item.width,
@@ -120,28 +135,31 @@ class VideoStreamingManagerImpl(
                             dstPort = MTPPacket.PORT_VIDEO_CHANNEL
                         )
 
-                        // 3. Transmit via UsbAccessoryManager
+                        // 3. Transmit via UsbAccessoryManager with 250ms video timeout
                         var allSuccess = true
                         for (packet in mtpPackets) {
-                            val success = usbAccessoryManager.send(packet)
+                            val success = usbAccessoryManager.send(packet, timeoutMs = 250L)
                             if (!success) {
                                 allSuccess = false
                                 break
                             }
                         }
                         if (allSuccess) {
+                            lastFrameSendTime = try {
+                                android.os.SystemClock.uptimeMillis()
+                            } catch (_: Throwable) {
+                                System.currentTimeMillis()
+                            }
                             _framesSent.value++
                             _bytesSent.value += webLinkBytes.size
                             framesInCurrentSecond.incrementAndGet()
                         } else {
+                            // If video packet timed out (USB busy), drop this frame and continue
                             logRepository.log(
                                 direction = LogDirection.INTERNAL,
                                 protocol = ProtocolType.SYSTEM,
-                                summary = "USB write failed during video streaming; stopping stream",
-                                isError = true
+                                summary = "Video frame dropped (USB busy or 250ms timeout)"
                             )
-                            stopStreaming()
-                            break
                         }
                     } catch (e: Exception) {
                         if (_isStreaming.value) {

@@ -18,7 +18,7 @@ import kotlinx.coroutines.launch
 class H264VideoEncoder(
     private val width: Int = 800,
     private val height: Int = 480,
-    private val bitrate: Int = 8_388_608, // 8 Mbps (matching Pioneer AppRadio / WebLink VideoConfig request)
+    private val bitrate: Int = 2_097_152, // 2 Mbps (keeps keyframe < 12 KB to avoid MTP fragmentation & USB buffer stalls)
     private val fps: Int = 30,
     private val iFrameInterval: Int = 1,
     private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default),

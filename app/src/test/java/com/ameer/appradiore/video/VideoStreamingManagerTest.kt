@@ -36,7 +36,7 @@ class VideoStreamingManagerTest {
         override fun requestPermission(accessory: UsbAccessory) {}
         override fun connect(accessory: UsbAccessory) {}
         override fun disconnect() {}
-        override suspend fun send(data: ByteArray): Boolean {
+        override suspend fun send(data: ByteArray, timeoutMs: Long): Boolean {
             sentBytes.add(data)
             return true
         }

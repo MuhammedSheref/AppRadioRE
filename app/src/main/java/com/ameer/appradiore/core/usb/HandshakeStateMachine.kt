@@ -505,6 +505,9 @@ class HandshakeStateMachineImpl(
                 sendSacCommand(SACCommand.SmartPhoneStatus(statusType = sacCmd.statusType))
                 sendSacCommand(SACCommand.ScreenTransitionHome)
                 startHeartbeat()
+                if (sacCmd.statusType == 0x20.toByte() && _currentStep.value == HandshakeStep.CONNECTED_READY) {
+                    _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
+                }
             }
             is SACCommand.EndAccessoryInfoReply -> {
                 logRepository.log(
@@ -787,23 +790,32 @@ class HandshakeStateMachineImpl(
     }
 
     private fun resolveEncoderParams(requestedParams: String, encodingType: Int = 2): String {
-        if (requestedParams.isBlank()) {
-            return "maxKeyFrameInterval=60,bitrate=8388608,fps=30"
-        }
-        val entries = requestedParams.split(';')
-        for (entry in entries) {
-            val trimmed = entry.trim()
-            if (trimmed.startsWith("$encodingType:")) {
-                return trimmed.substringAfter("$encodingType:").trim()
+        val base = if (requestedParams.isBlank()) {
+            "maxKeyFrameInterval=60,bitrate=2097152,fps=30"
+        } else {
+            val entries = requestedParams.split(';')
+            var found = ""
+            for (entry in entries) {
+                val trimmed = entry.trim()
+                if (trimmed.startsWith("$encodingType:")) {
+                    found = trimmed.substringAfter("$encodingType:").trim()
+                    break
+                }
             }
+            if (found.isEmpty() && requestedParams.startsWith("$encodingType:")) {
+                found = requestedParams.substringAfter("$encodingType:").trim()
+            }
+            if (found.isEmpty() && requestedParams.contains("=") && !requestedParams.contains(":")) {
+                found = requestedParams.trim()
+            }
+            found.ifEmpty { "maxKeyFrameInterval=60,bitrate=2097152,fps=30" }
         }
-        if (requestedParams.startsWith("$encodingType:")) {
-            return requestedParams.substringAfter("$encodingType:").trim()
+        // Cap bitrate to 2 Mbps (2,097,152 bps) to keep keyframe < 12 KB, preventing MTP fragmentation (>16KB) and USB endpoint deadlocks
+        return if (base.contains("bitrate=")) {
+            base.replace(Regex("bitrate=\\d+"), "bitrate=2097152")
+        } else {
+            "$base,bitrate=2097152"
         }
-        if (requestedParams.contains("=") && !requestedParams.contains(":")) {
-            return requestedParams.trim()
-        }
-        return "maxKeyFrameInterval=60,bitrate=8388608,fps=30"
     }
 
     private suspend fun sendDeferredVideoSetup(channelPort: Int = MTPPacket.PORT_VIDEO_CHANNEL) {

@@ -32,7 +32,7 @@ interface UsbDataSource {
 
     fun open(accessory: UsbAccessory): EmptyResult<DataError.Usb>
     fun close()
-    suspend fun write(data: ByteArray): EmptyResult<DataError.Usb>
+    suspend fun write(data: ByteArray, timeoutMs: Long = 2500L): EmptyResult<DataError.Usb>
 }
 
 class UsbDataSourceImpl(
@@ -106,9 +106,9 @@ class UsbDataSourceImpl(
         }
     }
 
-    override suspend fun write(data: ByteArray): EmptyResult<DataError.Usb> = withContext(Dispatchers.IO) {
+    override suspend fun write(data: ByteArray, timeoutMs: Long): EmptyResult<DataError.Usb> = withContext(Dispatchers.IO) {
         val stream = outputStream ?: return@withContext Result.Error(DataError.Usb.STREAM_CLOSED)
-        val writeSuccess = withTimeoutOrNull(2500L) {
+        val writeSuccess = withTimeoutOrNull(timeoutMs) {
             writeMutex.withLock {
                 try {
                     val hexPreview = data.take(64).joinToString(" ") { String.format("%02X", it) }
@@ -133,7 +133,6 @@ class UsbDataSourceImpl(
                         offset += chunkSize
                         remaining -= chunkSize
                     }
-                    stream.flush()
                     true
                 } catch (e: Exception) {
                     false

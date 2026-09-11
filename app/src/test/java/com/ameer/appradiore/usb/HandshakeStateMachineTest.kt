@@ -35,7 +35,7 @@ class HandshakeStateMachineTest {
         override fun requestPermission(accessory: UsbAccessory) {}
         override fun connect(accessory: UsbAccessory) {}
         override fun disconnect() {}
-        override suspend fun send(data: ByteArray): Boolean {
+        override suspend fun send(data: ByteArray, timeoutMs: Long): Boolean {
             sentBytes.add(data)
             return true
         }
@@ -439,7 +439,7 @@ class HandshakeStateMachineTest {
         assertEquals(800, confirmedCmd.clientWidth)
         assertEquals(480, confirmedCmd.clientHeight)
         assertEquals(2, confirmedCmd.frameEncoding)
-        assertEquals("maxKeyFrameInterval=60,bitrate=8388608,fps=30", confirmedCmd.encoderParams)
+        assertEquals("maxKeyFrameInterval=60,bitrate=2097152,fps=30", confirmedCmd.encoderParams)
 
         stateMachine.reset()
     }
