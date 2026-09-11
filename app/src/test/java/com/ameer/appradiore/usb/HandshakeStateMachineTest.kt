@@ -187,7 +187,8 @@ class HandshakeStateMachineTest {
         assertEquals(800, stateMachine.stereoSpecs.value.width)
         assertEquals(480, stateMachine.stereoSpecs.value.height)
         assertEquals(240, stateMachine.stereoSpecs.value.dpi)
-        assertTrue(stateMachine.stereoSpecs.value.isReadyForVideo)
+        // Video is NOT ready yet - requires SAC Auth to complete first
+        org.junit.Assert.assertFalse(stateMachine.stereoSpecs.value.isReadyForVideo)
 
         stateMachine.reset()
     }
@@ -254,7 +255,7 @@ class HandshakeStateMachineTest {
         assertEquals(0x0112.toShort(), stateMachine.stereoSpecs.value.modelId)
 
         // 5. DisplaySpecInfo (800x480)
-        val dispBytes = byteArrayOf(0, 0, 0, 0, 0, 0x03, 0x20, 0x01, 0xE0.toByte())
+        val dispBytes = byteArrayOf(0, 0x03, 0x20, 0x01, 0xE0.toByte(), 0x06, 0x0E, 0x03, 0x66)
         val dispFrame = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
             com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_PROC_SPEC,
             dispBytes
@@ -396,7 +397,32 @@ class HandshakeStateMachineTest {
         fakeUsb.incomingBytes.emit(videoConfigPacket)
         testScope.testScheduler.runCurrent()
 
-        // Verify that the reply confirms VideoConfig and extracted parameters correctly
+        // 1. Verify that VideoConfig reply is deferred prior to SAC authentication
+        val replyBeforeAuth = fakeUsb.sentBytes.firstOrNull { bytes ->
+            val decoded = com.ameer.appradiore.core.protocol.mtp.MTPCodec.decode(bytes)
+            decoded.packets.any { packet ->
+                val wlCmds = com.ameer.appradiore.core.protocol.weblink.WebLinkCodec.decode(packet.payload)
+                wlCmds.any { it is com.ameer.appradiore.core.protocol.weblink.WebLinkCommand.VideoConfig }
+            }
+        }
+        org.junit.Assert.assertNull("VideoConfig reply should be deferred before SAC auth", replyBeforeAuth)
+
+        // 2. Complete SAC Auth to trigger deferred video setup
+        val authRespPFormat = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
+            com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_AUTH,
+            byteArrayOf(0x00, 0x08, 0x00, 0x03, 0x00, 0x01)
+        )
+        fakeUsb.incomingBytes.emit(com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapControlChannelPayload(authRespPFormat))
+        testScope.testScheduler.runCurrent()
+
+        val endAccReply = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
+            com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_AUTH,
+            byteArrayOf(17, 1)
+        )
+        fakeUsb.incomingBytes.emit(com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapControlChannelPayload(endAccReply))
+        testScope.testScheduler.runCurrent()
+
+        // 3. Verify that the deferred reply confirms VideoConfig and extracted parameters correctly
         val replyMtp = fakeUsb.sentBytes.firstOrNull { bytes ->
             val decoded = com.ameer.appradiore.core.protocol.mtp.MTPCodec.decode(bytes)
             decoded.packets.any { packet ->
@@ -404,7 +430,7 @@ class HandshakeStateMachineTest {
                 wlCmds.any { it is com.ameer.appradiore.core.protocol.weblink.WebLinkCommand.VideoConfig }
             }
         }
-        org.junit.Assert.assertNotNull("VideoConfig reply should be sent", replyMtp)
+        org.junit.Assert.assertNotNull("VideoConfig reply should be sent after SAC auth", replyMtp)
 
         val mtpPackets = com.ameer.appradiore.core.protocol.mtp.MTPCodec.decode(replyMtp!!).packets
         val confirmedCmd = com.ameer.appradiore.core.protocol.weblink.WebLinkCodec.decode(mtpPackets[0].payload)[0]

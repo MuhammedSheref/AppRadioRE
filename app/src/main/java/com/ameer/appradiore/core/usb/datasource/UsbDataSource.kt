@@ -44,7 +44,7 @@ class UsbDataSourceImpl(
     private val usbManager = context.getSystemService(Context.USB_SERVICE) as UsbManager
 
     private val writeMutex = Mutex()
-    private val _incomingBytes = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+    private val _incomingBytes = MutableSharedFlow<ByteArray>(replay = 16, extraBufferCapacity = 64)
     override val incomingBytes: SharedFlow<ByteArray> = _incomingBytes.asSharedFlow()
 
     private var fileDescriptor: ParcelFileDescriptor? = null
@@ -154,9 +154,11 @@ class UsbDataSourceImpl(
         }
     }
 
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     override fun close() {
         readJob?.cancel()
         readJob = null
+        _incomingBytes.resetReplayCache()
 
         try {
             inputStream?.close()

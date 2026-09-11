@@ -150,9 +150,16 @@ class UsbAccessoryManagerImpl(
     }
 
     override fun scanForAccessory() {
+        val currentState = _connectionState.value
+        if (currentState is UsbConnectionState.Connected) {
+            return
+        }
         val accessoryList = usbManager.accessoryList
         if (!accessoryList.isNullOrEmpty()) {
             val accessory = accessoryList[0]
+            if (currentState is UsbConnectionState.Connecting && currentState.accessory == accessory) {
+                return
+            }
             logRepository.log(
                 direction = LogDirection.INTERNAL,
                 protocol = ProtocolType.USB,
@@ -169,6 +176,11 @@ class UsbAccessoryManagerImpl(
     }
 
     private fun handleAccessoryDiscovered(accessory: UsbAccessory) {
+        val currentState = _connectionState.value
+        if ((currentState is UsbConnectionState.Connected && currentState.accessory == accessory) ||
+            (currentState is UsbConnectionState.Connecting && currentState.accessory == accessory)) {
+            return
+        }
         if (usbManager.hasPermission(accessory)) {
             connect(accessory)
         } else {
@@ -194,6 +206,15 @@ class UsbAccessoryManagerImpl(
     }
 
     override fun connect(accessory: UsbAccessory) {
+        val currentState = _connectionState.value
+        if (currentState is UsbConnectionState.Connected && currentState.accessory == accessory) {
+            logRepository.log(
+                direction = LogDirection.INTERNAL,
+                protocol = ProtocolType.USB,
+                summary = "Already connected to ${accessory.manufacturer} ${accessory.model}, skipping redundant connection attempt."
+            )
+            return
+        }
         disconnect()
         _connectionState.value = UsbConnectionState.Connecting(accessory)
 

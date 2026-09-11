@@ -72,6 +72,8 @@ class HandshakeStateMachineImpl(
     private var stereoControlPort: Int = MTPPacket.PORT_CONTROL_CHANNEL
     private var stereoAddress: MTPAddress = MTPAddress.ANY_CONTROL
     private val packetBuffer = ByteArrayOutputStream()
+    private var pendingVideoConfig: WebLinkCommand.VideoConfig? = null
+    private var videoConfigAckSent: Boolean = false
 
     init {
         scope.launch {
@@ -109,28 +111,36 @@ class HandshakeStateMachineImpl(
             }
         }
 
-        // Fallback: If no auth was scheduled after 4 seconds, initiate AuthBegin.
-        // If MTP control channel was established (controlChannelReady), keep isMtpMode = true
-        // and send auth over MTP. Otherwise, fall back to bare PFormat for legacy head units.
+        // Proactively send MTP connection ACKs for both Port 12346 (Video) and Port 12347 (Control).
+        // This ensures the head unit's MTP router establishes both channels even if the initial SYNs arrived before the Android USB descriptor opened.
+        scope.launch {
+            delay(50L)
+            if (isActive && !isSacAuthenticated) {
+                val ack12346 = MTPCodec.createConnectionAck(
+                    srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), MTPPacket.PORT_VIDEO_CHANNEL),
+                    dstAddress = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), MTPPacket.PORT_VIDEO_CHANNEL)
+                )
+                val ack12347 = MTPCodec.createConnectionAck(
+                    srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), MTPPacket.PORT_CONTROL_CHANNEL),
+                    dstAddress = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), MTPPacket.PORT_CONTROL_CHANNEL)
+                )
+                usbAccessoryManager.send(ack12346)
+                usbAccessoryManager.send(ack12347)
+            }
+        }
+
+        // Fallback: If no auth was scheduled after 3 seconds, initiate AuthBegin.
+        // Pioneer AAM2 stereos always expect MTP wrapping on Port 12347.
         fallbackJob = scope.launch {
-            delay(4000L)
+            delay(3000L)
             if (!isSacAuthenticated && (authJob == null || authJob?.isActive != true)) {
-                if (controlChannelReady) {
-                    logRepository.log(
-                        direction = LogDirection.INTERNAL,
-                        protocol = ProtocolType.SYSTEM,
-                        summary = "Auth not yet started after 4s. MTP control channel is established; sending AuthBegin via MTP..."
-                    )
-                    // Keep isMtpMode = true — stereo expects MTP-wrapped SAC on Port 12347
-                } else {
-                    logRepository.log(
-                        direction = LogDirection.INTERNAL,
-                        protocol = ProtocolType.SYSTEM,
-                        summary = "No MTP connection request received within 4s. Attempting fallback direct AuthBegin..."
-                    )
-                    isMtpMode = false
-                }
-                scheduleAuthSequence(delayMs = 0L, source = if (controlChannelReady) "MTP Fallback" else "Non-MTP Fallback")
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "Control channel idle after 3s. Sending AuthBegin via MTP Port 12347..."
+                )
+                isMtpMode = true
+                scheduleAuthSequence(delayMs = 0L, source = "MTP Fallback")
             }
         }
     }
@@ -151,13 +161,21 @@ class HandshakeStateMachineImpl(
                 _currentStep.value = HandshakeStep.STEP_0_AUTH_BEGIN
             }
 
-            // Retry loop matching Pioneer's AccessoryAuthor (AUTH_INTERVAL = 3000ms, MAX_AUTH_COUNT = 3 attempts)
+            // Retry loop matching Pioneer's AccessoryAuthor with extended retry count for hotplug reconnection (up to 6 attempts)
             var attempt = 1
-            while (isActive && attempt <= 3 && !isSacAuthenticated) {
+            while (isActive && attempt <= 6 && !isSacAuthenticated) {
+                if (attempt > 1) {
+                    // Ping MTP control channel ACK before each retry to wake up any dormant MTP socket on head unit
+                    val ack12347 = MTPCodec.createConnectionAck(
+                        srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), MTPPacket.PORT_CONTROL_CHANNEL),
+                        dstAddress = MTPAddress(MTPAddress.TYPE_IPV4, byteArrayOf(127, 0, 0, 1), MTPPacket.PORT_CONTROL_CHANNEL)
+                    )
+                    usbAccessoryManager.send(ack12347)
+                }
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SYSTEM,
-                    summary = "Sending AuthBegin (Attempt $attempt of 3)..."
+                    summary = "Sending AuthBegin (Attempt $attempt of 6)..."
                 )
                 try {
                     sendSacCommand(SACCommand.AuthBegin)
@@ -172,14 +190,14 @@ class HandshakeStateMachineImpl(
                     )
                 }
                 attempt++
-                delay(3000L)
+                delay(2500L)
             }
 
             if (!isSacAuthenticated && _currentStep.value != HandshakeStep.CONNECTED_READY) {
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SYSTEM,
-                    summary = "No AuthResponse received after 3 attempts. Stereo may require returning to Home Menu or reconnecting.",
+                    summary = "No AuthResponse received after 6 attempts. If stereo is running, tap 'Apps' / 'AppRadio' on head unit screen to awaken AAM2 source.",
                     isError = true
                 )
             }
@@ -203,6 +221,8 @@ class HandshakeStateMachineImpl(
         stereoAddress = MTPAddress.ANY_CONTROL
         _currentStep.value = HandshakeStep.DISCONNECTED
         _stereoSpecs.value = StereoSpecs()
+        pendingVideoConfig = null
+        videoConfigAckSent = false
     }
 
     private suspend fun sendSacCommand(cmd: SACCommand) {
@@ -327,23 +347,11 @@ class HandshakeStateMachineImpl(
             )
 
             if (isVideo) {
-                // Pioneer WLServer.onConnectionEstablished sends SetCurrentApp("aam2serverapp://")
-                // immediately upon Port 12346 connection to notify stereo WebLink client of active server
-                val setAppCmd = WebLinkCommand.SetCurrentApp(appId = WebLinkCommand.APP_ID_AAM2, appParams = "")
-                val setAppBytes = WebLinkCodec.encode(setAppCmd)
-                val setAppHex = setAppBytes.take(64).joinToString(" ") { String.format("%02X", it) }
                 logRepository.log(
-                    direction = LogDirection.OUTGOING,
+                    direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.WEBLINK,
-                    summary = "TX WebLink: SetCurrentApp (\"${WebLinkCommand.APP_ID_AAM2}\") on Port 12346",
-                    rawHex = setAppHex
+                    summary = "WebLink Video Channel (Port 12346) established. Deferring WebLink commands until SAC auth completes."
                 )
-                val setAppMtpVideo = MTPCodec.wrapPayload(
-                    payload = setAppBytes,
-                    srcPort = MTPPacket.PORT_VIDEO_CHANNEL,
-                    dstPort = packet.srcAddress.port
-                )
-                usbAccessoryManager.send(setAppMtpVideo)
             }
 
             if (isControl && !isSacAuthenticated) {
@@ -495,6 +503,7 @@ class HandshakeStateMachineImpl(
                     summary = "Stereo requested SmartPhoneStatus (type: 0x${String.format("%02X", sacCmd.statusType)}). Replying with SmartPhoneStatus..."
                 )
                 sendSacCommand(SACCommand.SmartPhoneStatus(statusType = sacCmd.statusType))
+                sendSacCommand(SACCommand.ScreenTransitionHome)
                 startHeartbeat()
             }
             is SACCommand.EndAccessoryInfoReply -> {
@@ -509,9 +518,18 @@ class HandshakeStateMachineImpl(
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SAC,
-                    summary = "Stereo requested App Info. Sending StartAppInfoReply..."
+                    summary = "Stereo requested App Info. Registering AppRadio launcher..."
                 )
+                // 1. Reply to StartAppInfo
                 sendSacCommand(SACCommand.StartAppInfoReply(status = 1))
+                // 2. Announce App Name for token 1
+                sendSacCommand(SACCommand.AppNameReply(appToken = 1, appName = "AppRadio"))
+                // 3. Announce Package Name for token 1
+                sendSacCommand(SACCommand.PackageNameReply(appToken = 1, packageName = "jp.pioneer.mbg.appradio.AppRadioLauncher"))
+                // 4. End App Info
+                sendSacCommand(SACCommand.EndAppInfoReply(status = 1))
+                // 5. Complete App Accessory handshake
+                sendSacCommand(SACCommand.EndAppAcc)
             }
             is SACCommand.AppInfoRequest -> {
                 _currentStep.value = HandshakeStep.STEP_7_APP_INFO
@@ -627,7 +645,32 @@ class HandshakeStateMachineImpl(
                 )
                 _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
                 _currentStep.value = HandshakeStep.CONNECTED_READY
+                sendSacCommand(SACCommand.ScreenTransitionHome)
+                sendSacCommand(SACCommand.SmartPhoneStatus())
                 startHeartbeat()
+                sendDeferredVideoSetup()
+            }
+            is SACCommand.StereoKeyEvent -> {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Stereo Key/Touch Event received (${sacCmd.rawPayload.size} bytes). Activating mirror canvas..."
+                )
+                _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
+                _currentStep.value = HandshakeStep.CONNECTED_READY
+                sendSacCommand(SACCommand.ScreenTransitionHome)
+                sendSacCommand(SACCommand.SmartPhoneStatus())
+            }
+            is SACCommand.AppLaunchRequest -> {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Stereo requested App Launch (type: ${sacCmd.launchType}, pkg: ${sacCmd.packageName}, token: ${sacCmd.appToken}). Activating mirror canvas..."
+                )
+                _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
+                _currentStep.value = HandshakeStep.CONNECTED_READY
+                sendSacCommand(SACCommand.ScreenTransitionHome)
+                sendSacCommand(SACCommand.SmartPhoneStatus())
             }
             is SACCommand.VideoOutputRequest -> {
                 logRepository.log(
@@ -639,6 +682,7 @@ class HandshakeStateMachineImpl(
                 _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
                 _currentStep.value = HandshakeStep.CONNECTED_READY
                 startHeartbeat()
+                sendDeferredVideoSetup()
             }
             else -> Unit
         }
@@ -666,6 +710,14 @@ class HandshakeStateMachineImpl(
                 )
             }
             is WebLinkCommand.SyncSessionTime -> {
+                if (!isSacAuthenticated) {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.WEBLINK,
+                        summary = "RX WebLink: SyncSessionTime received before SAC auth. Deferring echo to keep control channel clear."
+                    )
+                    return
+                }
                 val serverTime = try {
                     android.os.SystemClock.uptimeMillis()
                 } catch (_: Throwable) {
@@ -699,40 +751,9 @@ class HandshakeStateMachineImpl(
                 val h = cmd.clientHeight.takeIf { it > 0 } ?: cmd.sourceHeight
                 _stereoSpecs.value = _stereoSpecs.value.copy(
                     width = w,
-                    height = h,
-                    isReadyForVideo = true
+                    height = h
                 )
-
-                // Dynamically resolve encoder params for H.264 matching stereo request
-                val confirmedParams = resolveEncoderParams(cmd.encoderParams, encodingType = 2)
-
-                // Reply confirming video config: H.264 matching stereo request
-                val reply = WebLinkCommand.VideoConfig(
-                    sourceWidth = cmd.sourceWidth,
-                    sourceHeight = cmd.sourceHeight,
-                    clientWidth = cmd.clientWidth,
-                    clientHeight = cmd.clientHeight,
-                    frameEncoding = 2, // H.264
-                    encoderParams = confirmedParams
-                )
-                val replyBytes = WebLinkCodec.encode(reply)
-                val replyHex = replyBytes.take(64).joinToString(" ") { String.format("%02X", it) }
-                logRepository.log(
-                    direction = LogDirection.OUTGOING,
-                    protocol = ProtocolType.WEBLINK,
-                    summary = "TX WebLink: VideoConfig Confirm (${w}x${h}, H.264, params='$confirmedParams')",
-                    rawHex = replyHex
-                )
-                if (isMtpMode) {
-                    val wireBytes = MTPCodec.wrapPayload(
-                        payload = replyBytes,
-                        srcPort = channelPort,
-                        dstPort = channelPort
-                    )
-                    usbAccessoryManager.send(wireBytes)
-                } else {
-                    usbAccessoryManager.send(replyBytes)
-                }
+                pendingVideoConfig = cmd
 
                 val dpiText = if (_stereoSpecs.value.dpi > 0) " @ ${_stereoSpecs.value.dpi} DPI" else ""
                 logRepository.log(
@@ -741,26 +762,16 @@ class HandshakeStateMachineImpl(
                     summary = "=== WebLink Video Negotiated (${w}x${h}$dpiText) ==="
                 )
 
-                // Trigger stereo mirror screen: SetCurrentApp("aam2serverapp://") ONLY on Port 12346 (Video Channel)
-                val setAppCmd = WebLinkCommand.SetCurrentApp(appId = WebLinkCommand.APP_ID_AAM2, appParams = "")
-                val setAppBytes = WebLinkCodec.encode(setAppCmd)
-                val setAppHex = setAppBytes.take(64).joinToString(" ") { String.format("%02X", it) }
-                logRepository.log(
-                    direction = LogDirection.OUTGOING,
-                    protocol = ProtocolType.WEBLINK,
-                    summary = "TX WebLink: SetCurrentApp (\"${WebLinkCommand.APP_ID_AAM2}\") -> Activate Mirror Screen",
-                    rawHex = setAppHex
-                )
-                if (isMtpMode) {
-                    val setAppMtpVideo = MTPCodec.wrapPayload(
-                        payload = setAppBytes,
-                        srcPort = channelPort,
-                        dstPort = channelPort
+                if (!isSacAuthenticated) {
+                    logRepository.log(
+                        direction = LogDirection.INTERNAL,
+                        protocol = ProtocolType.WEBLINK,
+                        summary = "VideoConfig parsed (${w}x${h}, H.264). Deferring VideoConfig Confirm & SetCurrentApp until SAC auth completes."
                     )
-                    usbAccessoryManager.send(setAppMtpVideo)
-                } else {
-                    usbAccessoryManager.send(setAppBytes)
+                    return
                 }
+
+                sendDeferredVideoSetup(channelPort)
             }
             is WebLinkCommand.Touch -> {
                 val pt = cmd.points.firstOrNull()
@@ -793,6 +804,65 @@ class HandshakeStateMachineImpl(
             return requestedParams.trim()
         }
         return "maxKeyFrameInterval=60,bitrate=8388608,fps=30"
+    }
+
+    private suspend fun sendDeferredVideoSetup(channelPort: Int = MTPPacket.PORT_VIDEO_CHANNEL) {
+        val cfg = pendingVideoConfig ?: return
+        if (videoConfigAckSent) return
+        videoConfigAckSent = true
+
+        val w = cfg.clientWidth.takeIf { it > 0 } ?: cfg.sourceWidth
+        val h = cfg.clientHeight.takeIf { it > 0 } ?: cfg.sourceHeight
+        val confirmedParams = resolveEncoderParams(cfg.encoderParams, encodingType = 2)
+
+        // 1. Send SetCurrentApp("aam2serverapp://") to notify head unit of active launcher
+        val setAppCmd = WebLinkCommand.SetCurrentApp(appId = WebLinkCommand.APP_ID_AAM2, appParams = "")
+        val setAppBytes = WebLinkCodec.encode(setAppCmd)
+        val setAppHex = setAppBytes.take(64).joinToString(" ") { String.format("%02X", it) }
+        logRepository.log(
+            direction = LogDirection.OUTGOING,
+            protocol = ProtocolType.WEBLINK,
+            summary = "TX WebLink: SetCurrentApp (\"${WebLinkCommand.APP_ID_AAM2}\") on Port 12346",
+            rawHex = setAppHex
+        )
+        if (isMtpMode) {
+            val setAppMtpVideo = MTPCodec.wrapPayload(
+                payload = setAppBytes,
+                srcPort = channelPort,
+                dstPort = channelPort
+            )
+            usbAccessoryManager.send(setAppMtpVideo)
+        } else {
+            usbAccessoryManager.send(setAppBytes)
+        }
+
+        // 2. Send VideoConfig Confirm to initialize stereo hardware H.264 decoder
+        val reply = WebLinkCommand.VideoConfig(
+            sourceWidth = cfg.sourceWidth,
+            sourceHeight = cfg.sourceHeight,
+            clientWidth = cfg.clientWidth,
+            clientHeight = cfg.clientHeight,
+            frameEncoding = 2, // H.264
+            encoderParams = confirmedParams
+        )
+        val replyBytes = WebLinkCodec.encode(reply)
+        val replyHex = replyBytes.take(64).joinToString(" ") { String.format("%02X", it) }
+        logRepository.log(
+            direction = LogDirection.OUTGOING,
+            protocol = ProtocolType.WEBLINK,
+            summary = "TX WebLink: VideoConfig Confirm (${w}x${h}, H.264, params='$confirmedParams')",
+            rawHex = replyHex
+        )
+        if (isMtpMode) {
+            val wireBytes = MTPCodec.wrapPayload(
+                payload = replyBytes,
+                srcPort = channelPort,
+                dstPort = channelPort
+            )
+            usbAccessoryManager.send(wireBytes)
+        } else {
+            usbAccessoryManager.send(replyBytes)
+        }
     }
 
     private fun startHeartbeat() {
