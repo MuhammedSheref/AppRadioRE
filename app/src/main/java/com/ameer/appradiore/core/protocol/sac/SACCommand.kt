@@ -269,6 +269,29 @@ sealed class SACCommand {
         override val opcode: Byte = OP_A2S_APPS
     }
 
+    data object ScreenTransitionHome : SACCommand() {
+        override val opcode: Byte = OP_S2A_SCREEN
+        const val SUBTYPE: Byte = 0
+        const val KEYCODE: Byte = 0
+    }
+
+    data class StereoKeyEvent(
+        val rawPayload: ByteArray
+    ) : SACCommand() {
+        override val opcode: Byte = OP_A2S_KEY
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+            other as StereoKeyEvent
+            return rawPayload.contentEquals(other.rawPayload)
+        }
+
+        override fun hashCode(): Int {
+            return rawPayload.contentHashCode()
+        }
+    }
+
     data class RequestPhoneStatus(
         val statusType: Byte = 0x20 // 0x20 = AccessoryStatus/Park, 0x21 = Media
     ) : SACCommand() {
@@ -277,9 +300,9 @@ sealed class SACCommand {
 
     data class SmartPhoneStatus(
         val statusType: Byte = 0x20,
-        val hdmiPackage: Byte = 0x00,
+        val hdmiPackage: Byte = 0x02, // 2 = AppRadio in foreground (FrontAplMonitor.java)
         val soundCategory: Byte = 0x01,
-        val appToken: Short = 0
+        val appToken: Short = 1
     ) : SACCommand() {
         override val opcode: Byte = OP_S2A_NOTIFICATION
     }

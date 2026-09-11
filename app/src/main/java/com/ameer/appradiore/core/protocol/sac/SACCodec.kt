@@ -103,6 +103,10 @@ object SACCodec {
             is SACCommand.TerminateSession -> {
                 dos.writeByte(cmd.type.toInt())
             }
+            is SACCommand.ScreenTransitionHome -> {
+                dos.writeByte(SACCommand.ScreenTransitionHome.SUBTYPE.toInt())
+                dos.writeByte(SACCommand.ScreenTransitionHome.KEYCODE.toInt())
+            }
             is SACCommand.SmartPhoneStatus -> {
                 dos.writeByte(cmd.statusType.toInt())
                 dos.writeByte(cmd.hdmiPackage.toInt())
@@ -145,6 +149,7 @@ object SACCodec {
                 SACCommand.OP_A2S_APPIMAGE_TRANSFER_REQUEST -> decodeAppImageRequest(dis, payload)
                 SACCommand.OP_A2S_REMOTECTRL -> decodeRemoteCtrl(dis, payload)
                 SACCommand.OP_A2S_APPS -> decodeApps(dis, payload)
+                SACCommand.OP_A2S_KEY -> SACCommand.StereoKeyEvent(payload)
                 else -> SACCommand.UnknownSACCommand(opcode, payload)
             }
         } catch (e: Exception) {
@@ -179,11 +184,11 @@ object SACCodec {
     private fun decodeProcSpec(dis: DataInputStream, raw: ByteArray): SACCommand {
         val subtype = dis.readByte()
         return when (subtype.toInt()) {
-            0 -> { // DISPLAY_INFO
-                dis.readShort() // pad
-                dis.readShort() // pad
+            0 -> { // DISPLAY_INFO: [subtype(1B), width(2B), height(2B), physicalWidth(2B), physicalHeight(2B), pad(4B)]
                 val width = dis.readShort().toInt() and 0xFFFF
                 val height = dis.readShort().toInt() and 0xFFFF
+                val physicalWidth = if (dis.available() >= 2) dis.readShort().toInt() and 0xFFFF else width
+                val physicalHeight = if (dis.available() >= 2) dis.readShort().toInt() and 0xFFFF else height
                 SACCommand.DisplaySpecInfo(width, height)
             }
             1 -> { // SPEC_INFO

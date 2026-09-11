@@ -13,7 +13,9 @@ class SACCodecTest {
 
     @Test
     fun testEncodeAuthBegin() {
+        assertEquals(SACCommand.OP_S2A_AUTH, SACCommand.AuthBegin.opcode)
         val encoded = SACCodec.encode(SACCommand.AuthBegin)
+        // Pioneer AAM2 SmartPhoneProtocolMachine writes exactly 1 byte for AuthBegin (type 0)
         assertArrayEquals(byteArrayOf(0x00), encoded)
     }
 
@@ -30,19 +32,21 @@ class SACCodecTest {
     }
 
     @Test
-    fun testDecodeAuthResponse() {
+    fun testDecodeAuthResponseAam2() {
+        // Stereo replies: subtype 0, accessoryType 8 (LINKWITH_AAM2), version 3.1
         val payload = byteArrayOf(
             0x00,                   // subtype: AuthResponse
-            0x00,                   // result: 0 (OK)
+            0x08,                   // result: 8 (LINKWITH_AAM2)
             0x00, 0x03,             // major 3
             0x00, 0x01              // minor 1
         )
         val decoded = SACCodec.decode(SACCommand.OP_A2S_AUTH, payload)
         assertTrue(decoded is SACCommand.AuthResponse)
         val authResp = decoded as SACCommand.AuthResponse
-        assertEquals(0.toByte(), authResp.result)
+        assertEquals(8.toByte(), authResp.result)
         assertEquals(3.toShort(), authResp.majorVersion)
         assertEquals(1.toShort(), authResp.minorVersion)
+        assertTrue(authResp.isSuccess)
     }
 
     @Test
@@ -50,10 +54,11 @@ class SACCodecTest {
         val bos = ByteArrayOutputStream()
         val dos = DataOutputStream(bos)
         dos.writeByte(0)            // subtype: display info
-        dos.writeShort(0)           // pad
-        dos.writeShort(0)           // pad
-        dos.writeShort(800)         // width
-        dos.writeShort(480)         // height
+        dos.writeShort(800)         // width (0x0320)
+        dos.writeShort(480)         // height (0x01E0)
+        dos.writeShort(1550)        // physical width (0x060E)
+        dos.writeShort(870)         // physical height (0x0366)
+        dos.writeInt(-1)            // pad (0xFFFFFFFF)
 
         val decoded = SACCodec.decode(SACCommand.OP_A2S_PROC_SPEC, bos.toByteArray())
         assertTrue(decoded is SACCommand.DisplaySpecInfo)
@@ -105,8 +110,17 @@ class SACCodecTest {
 
     @Test
     fun testEncodeSmartPhoneStatus() {
-        val encoded = SACCodec.encode(SACCommand.SmartPhoneStatus(statusType = 0x20))
-        assertArrayEquals(byteArrayOf(0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00), encoded)
+        val encodedDefault = SACCodec.encode(SACCommand.SmartPhoneStatus())
+        assertArrayEquals(byteArrayOf(0x20, 0x02, 0x01, 0x00, 0x00, 0x01, 0x00), encodedDefault)
+
+        val encodedCustom = SACCodec.encode(SACCommand.SmartPhoneStatus(statusType = 0x21, hdmiPackage = 0x00, soundCategory = 0x01, appToken = 0))
+        assertArrayEquals(byteArrayOf(0x21, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00), encodedCustom)
+    }
+
+    @Test
+    fun testEncodeScreenTransitionHome() {
+        val encoded = SACCodec.encode(SACCommand.ScreenTransitionHome)
+        assertArrayEquals(byteArrayOf(0x00, 0x00), encoded)
     }
 
     @Test

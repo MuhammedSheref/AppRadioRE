@@ -9,6 +9,23 @@ import org.junit.Test
 class PFormatCodecTest {
 
     @Test
+    fun testEncodeAuthBeginPFormatFrame() {
+        // SAC AuthBegin: Command ID = 0x00, Payload = [0x00]
+        // Checksum: 0x00 ^ 0x00 = 0x00
+        // Expected wire: [0x9F, 0x02, 0x00, 0x00, 0x00, 0x9F, 0x03] (7 bytes)
+        val encoded = PFormatCodec.encode(0x00.toByte(), byteArrayOf(0x00))
+        val expected = byteArrayOf(
+            0x9F.toByte(), 0x02,
+            0x00, // command ID
+            0x00, // AuthBegin subtype 0
+            0x00, // XOR checksum
+            0x9F.toByte(), 0x03
+        )
+        assertEquals(7, encoded.size)
+        assertArrayEquals(expected, encoded)
+    }
+
+    @Test
     fun testEncodeBasicPacket() {
         // Command ID: 0x01, Payload: [0x02, 0x03]
         // Checksum: 0x01 ^ 0x02 ^ 0x03 = 0x00

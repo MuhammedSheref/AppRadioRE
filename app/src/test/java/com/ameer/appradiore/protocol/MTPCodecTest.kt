@@ -68,6 +68,29 @@ class MTPCodecTest {
     }
 
     @Test
+    fun testAuthBeginEndToEndMtpWireBytes() {
+        // SAC AuthBegin payload: [0x00]
+        // PFormat encoded: [0x9F, 0x02, 0x00, 0x00, 0x00, 0x9F, 0x03] (7 bytes)
+        val pFormatAuthBegin = byteArrayOf(0x9F.toByte(), 0x02, 0x00, 0x00, 0x00, 0x9F.toByte(), 0x03)
+        val mtpBytes = MTPCodec.wrapControlChannelPayload(
+            payload = pFormatAuthBegin,
+            srcPort = MTPPacket.PORT_CONTROL_CHANNEL,
+            dstPort = MTPPacket.PORT_CONTROL_CHANNEL
+        )
+
+        // Exact wire packet: 27 bytes matching Pioneer live protocol log
+        val expectedWire = byteArrayOf(
+            0x1E, 0x00, 0x1B, 0x00, 0x00,                         // MTP header (length = 27 = 0x001B)
+            0x01, 0x7F, 0x00, 0x00, 0x01, 0x30, 0x3B,             // Src: 127.0.0.1:12347
+            0x01, 0x7F, 0x00, 0x00, 0x01, 0x30, 0x3B,             // Dst: 127.0.0.1:12347
+            0x9F.toByte(), 0x02, 0x00, 0x00, 0x00, 0x9F.toByte(), 0x03, // PFormat frame
+            0x03                                                  // MTP end delimiter
+        )
+        assertEquals(27, mtpBytes.size)
+        assertArrayEquals(expectedWire, mtpBytes)
+    }
+
+    @Test
     fun testPartialFrameBufferPreservation() {
         val samplePayload = byteArrayOf(0x10, 0x20)
         val encoded = MTPCodec.wrapControlChannelPayload(samplePayload)
