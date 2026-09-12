@@ -33,7 +33,7 @@ interface UsbAccessoryManager {
     fun requestPermission(accessory: UsbAccessory)
     fun connect(accessory: UsbAccessory)
     fun disconnect()
-    suspend fun send(data: ByteArray, timeoutMs: Long = 2500L): Boolean
+    suspend fun send(data: ByteArray): Boolean
     fun simulateConnect()
 }
 
@@ -239,9 +239,9 @@ class UsbAccessoryManagerImpl(
             }
     }
 
-    override suspend fun send(data: ByteArray, timeoutMs: Long): Boolean {
+    override suspend fun send(data: ByteArray): Boolean {
         var success = false
-        usbDataSource.write(data, timeoutMs)
+        usbDataSource.write(data)
             .onSuccess { success = true }
             .onFailure { error ->
                 logRepository.log(
