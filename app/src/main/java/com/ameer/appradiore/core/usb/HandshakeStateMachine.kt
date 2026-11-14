@@ -12,6 +12,7 @@ import com.ameer.appradiore.core.protocol.sac.SACCodec
 import com.ameer.appradiore.core.protocol.sac.SACCommand
 import com.ameer.appradiore.core.protocol.weblink.WebLinkCodec
 import com.ameer.appradiore.core.protocol.weblink.WebLinkCommand
+import com.ameer.appradiore.core.video.VideoStreamingManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -51,7 +52,8 @@ interface HandshakeStateMachine {
 class HandshakeStateMachineImpl(
     private val usbAccessoryManager: UsbAccessoryManager,
     private val logRepository: LogRepository,
-    private val scope: CoroutineScope
+    private val scope: CoroutineScope,
+    private val videoStreamingManager: VideoStreamingManager? = null
 ) : HandshakeStateMachine {
 
     private val _currentStep = MutableStateFlow(HandshakeStep.DISCONNECTED)
@@ -73,6 +75,7 @@ class HandshakeStateMachineImpl(
     private var stereoAddress: MTPAddress = MTPAddress.ANY_CONTROL
     private val packetBuffer = ByteArrayOutputStream()
     private var pendingVideoConfig: WebLinkCommand.VideoConfig? = null
+    private var pendingSyncSessionTime: WebLinkCommand.SyncSessionTime? = null
     private var videoConfigAckSent: Boolean = false
 
     init {
@@ -222,7 +225,9 @@ class HandshakeStateMachineImpl(
         _currentStep.value = HandshakeStep.DISCONNECTED
         _stereoSpecs.value = StereoSpecs()
         pendingVideoConfig = null
+        pendingSyncSessionTime = null
         videoConfigAckSent = false
+        videoStreamingManager?.stopStreaming()
     }
 
     private suspend fun sendSacCommand(cmd: SACCommand) {
@@ -257,7 +262,7 @@ class HandshakeStateMachineImpl(
             pFormatFramed
         }
 
-        usbAccessoryManager.send(wireBytes)
+        usbAccessoryManager.send(wireBytes, isHighPriority = true)
     }
 
     private suspend fun processIncomingBytes(bytes: ByteArray) {
@@ -339,7 +344,7 @@ class HandshakeStateMachineImpl(
                 srcAddress = MTPAddress(MTPAddress.TYPE_IPV4, packet.srcAddress.ip, ackPort),
                 dstAddress = packet.srcAddress
             )
-            usbAccessoryManager.send(ack)
+            usbAccessoryManager.send(ack, isHighPriority = true)
             logRepository.log(
                 direction = LogDirection.OUTGOING,
                 protocol = ProtocolType.MTP,
@@ -711,40 +716,15 @@ class HandshakeStateMachineImpl(
             }
             is WebLinkCommand.SyncSessionTime -> {
                 if (!isSacAuthenticated) {
+                    pendingSyncSessionTime = cmd
                     logRepository.log(
                         direction = LogDirection.INTERNAL,
                         protocol = ProtocolType.WEBLINK,
-                        summary = "RX WebLink: SyncSessionTime received before SAC auth. Deferring echo to keep control channel clear."
+                        summary = "RX WebLink: SyncSessionTime received before SAC auth. Deferring echo until SAC auth completes."
                     )
                     return
                 }
-                val serverTime = try {
-                    android.os.SystemClock.uptimeMillis()
-                } catch (_: Throwable) {
-                    System.currentTimeMillis()
-                }
-                val reply = WebLinkCommand.SyncSessionTime(
-                    clientTime = cmd.clientTime,
-                    serverTime = serverTime
-                )
-                val replyBytes = WebLinkCodec.encode(reply)
-                val replyHex = replyBytes.joinToString(" ") { String.format("%02X", it) }
-                logRepository.log(
-                    direction = LogDirection.OUTGOING,
-                    protocol = ProtocolType.WEBLINK,
-                    summary = "TX WebLink: SyncSessionTime Reply (clientTime=${cmd.clientTime}, serverTime=$serverTime)",
-                    rawHex = replyHex
-                )
-                if (isMtpMode) {
-                    val wireBytes = MTPCodec.wrapPayload(
-                        payload = replyBytes,
-                        srcPort = channelPort,
-                        dstPort = channelPort
-                    )
-                    usbAccessoryManager.send(wireBytes)
-                } else {
-                    usbAccessoryManager.send(replyBytes)
-                }
+                sendSyncSessionTimeReply(cmd, channelPort)
             }
             is WebLinkCommand.VideoConfig -> {
                 val w = cmd.clientWidth.takeIf { it > 0 } ?: cmd.sourceWidth
@@ -761,6 +741,9 @@ class HandshakeStateMachineImpl(
                     protocol = ProtocolType.SYSTEM,
                     summary = "=== WebLink Video Negotiated (${w}x${h}$dpiText) ==="
                 )
+
+                // Pre-warm the video pipeline early so the H.264 encoder is ready with the first IDR keyframe
+                videoStreamingManager?.prewarm(width = w, height = h, fps = 30)
 
                 if (!isSacAuthenticated) {
                     logRepository.log(
@@ -786,27 +769,52 @@ class HandshakeStateMachineImpl(
         }
     }
 
+    private suspend fun sendSyncSessionTimeReply(
+        cmd: WebLinkCommand.SyncSessionTime,
+        channelPort: Int = MTPPacket.PORT_VIDEO_CHANNEL
+    ) {
+        val serverTime = try {
+            android.os.SystemClock.uptimeMillis()
+        } catch (_: Throwable) {
+            System.currentTimeMillis()
+        }
+        val reply = WebLinkCommand.SyncSessionTime(
+            clientTime = cmd.clientTime,
+            serverTime = serverTime
+        )
+        val replyBytes = WebLinkCodec.encode(reply)
+        val replyHex = replyBytes.joinToString(" ") { String.format("%02X", it) }
+        logRepository.log(
+            direction = LogDirection.OUTGOING,
+            protocol = ProtocolType.WEBLINK,
+            summary = "TX WebLink: SyncSessionTime Reply (clientTime=${cmd.clientTime}, serverTime=$serverTime)",
+            rawHex = replyHex
+        )
+        if (isMtpMode) {
+            val wireBytes = MTPCodec.wrapPayload(
+                payload = replyBytes,
+                srcPort = channelPort,
+                dstPort = channelPort
+            )
+            usbAccessoryManager.send(wireBytes, isHighPriority = true)
+        } else {
+            usbAccessoryManager.send(replyBytes, isHighPriority = true)
+        }
+    }
+
     private fun resolveEncoderParams(requestedParams: String, encodingType: Int = 2): String {
-        if (requestedParams.isBlank()) {
-            return "maxKeyFrameInterval=60,bitrate=8388608,fps=30"
-        }
-        val entries = requestedParams.split(';')
-        for (entry in entries) {
-            val trimmed = entry.trim()
-            if (trimmed.startsWith("$encodingType:")) {
-                return trimmed.substringAfter("$encodingType:").trim()
-            }
-        }
-        if (requestedParams.startsWith("$encodingType:")) {
-            return requestedParams.substringAfter("$encodingType:").trim()
-        }
-        if (requestedParams.contains("=") && !requestedParams.contains(":")) {
-            return requestedParams.trim()
-        }
-        return "maxKeyFrameInterval=60,bitrate=8388608,fps=30"
+        // Enforce Pioneer AAM2 spec: 2 Mbps (2,097,152 bps), 30 fps, maxKeyFrameInterval=60
+        // The stereo requests 8 Mbps offer, but the phone must confirm 2 Mbps to avoid overwhelming USB / hardware decoder.
+        return "maxKeyFrameInterval=60,bitrate=2097152,fps=30"
     }
 
     private suspend fun sendDeferredVideoSetup(channelPort: Int = MTPPacket.PORT_VIDEO_CHANNEL) {
+        // 1. Echo pending SyncSessionTime if received earlier before SAC auth
+        pendingSyncSessionTime?.let { syncCmd ->
+            sendSyncSessionTimeReply(syncCmd, channelPort)
+            pendingSyncSessionTime = null
+        }
+
         val cfg = pendingVideoConfig ?: return
         if (videoConfigAckSent) return
         videoConfigAckSent = true
@@ -815,7 +823,7 @@ class HandshakeStateMachineImpl(
         val h = cfg.clientHeight.takeIf { it > 0 } ?: cfg.sourceHeight
         val confirmedParams = resolveEncoderParams(cfg.encoderParams, encodingType = 2)
 
-        // 1. Send SetCurrentApp("aam2serverapp://") to notify head unit of active launcher
+        // 2. Send SetCurrentApp("aam2serverapp://") to notify head unit of active launcher
         val setAppCmd = WebLinkCommand.SetCurrentApp(appId = WebLinkCommand.APP_ID_AAM2, appParams = "")
         val setAppBytes = WebLinkCodec.encode(setAppCmd)
         val setAppHex = setAppBytes.take(64).joinToString(" ") { String.format("%02X", it) }
@@ -831,12 +839,12 @@ class HandshakeStateMachineImpl(
                 srcPort = channelPort,
                 dstPort = channelPort
             )
-            usbAccessoryManager.send(setAppMtpVideo)
+            usbAccessoryManager.send(setAppMtpVideo, isHighPriority = true)
         } else {
-            usbAccessoryManager.send(setAppBytes)
+            usbAccessoryManager.send(setAppBytes, isHighPriority = true)
         }
 
-        // 2. Send VideoConfig Confirm to initialize stereo hardware H.264 decoder
+        // 3. Send VideoConfig Confirm to initialize stereo hardware H.264 decoder
         val reply = WebLinkCommand.VideoConfig(
             sourceWidth = cfg.sourceWidth,
             sourceHeight = cfg.sourceHeight,
@@ -859,10 +867,14 @@ class HandshakeStateMachineImpl(
                 srcPort = channelPort,
                 dstPort = channelPort
             )
-            usbAccessoryManager.send(wireBytes)
+            usbAccessoryManager.send(wireBytes, isHighPriority = true)
         } else {
-            usbAccessoryManager.send(replyBytes)
+            usbAccessoryManager.send(replyBytes, isHighPriority = true)
         }
+
+        // 4. Trigger video streaming immediately so that the pre-warmed initial H.264 IDR keyframe
+        // is transmitted right behind VideoConfig Confirm to immediately satisfy GStreamer preroll!
+        videoStreamingManager?.startStreaming(width = w, height = h, fps = 30)
     }
 
     private fun startHeartbeat() {

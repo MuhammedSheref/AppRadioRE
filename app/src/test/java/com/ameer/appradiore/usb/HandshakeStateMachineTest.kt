@@ -17,6 +17,7 @@ import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -35,7 +36,7 @@ class HandshakeStateMachineTest {
         override fun requestPermission(accessory: UsbAccessory) {}
         override fun connect(accessory: UsbAccessory) {}
         override fun disconnect() {}
-        override suspend fun send(data: ByteArray): Boolean {
+        override suspend fun send(data: ByteArray, isHighPriority: Boolean): Boolean {
             sentBytes.add(data)
             return true
         }
@@ -439,8 +440,109 @@ class HandshakeStateMachineTest {
         assertEquals(800, confirmedCmd.clientWidth)
         assertEquals(480, confirmedCmd.clientHeight)
         assertEquals(2, confirmedCmd.frameEncoding)
-        assertEquals("maxKeyFrameInterval=60,bitrate=8388608,fps=30", confirmedCmd.encoderParams)
+        assertEquals("maxKeyFrameInterval=60,bitrate=2097152,fps=30", confirmedCmd.encoderParams)
 
         stateMachine.reset()
+    }
+
+    private class FakeTestVideoStreamingManager : com.ameer.appradiore.core.video.VideoStreamingManager {
+        override val isStreaming = kotlinx.coroutines.flow.MutableStateFlow(false)
+        override val fps = kotlinx.coroutines.flow.MutableStateFlow(0)
+        override val framesSent = kotlinx.coroutines.flow.MutableStateFlow(0L)
+        override val bytesSent = kotlinx.coroutines.flow.MutableStateFlow(0L)
+
+        var prewarmCalled = false
+        var startStreamingCalled = false
+        var stopStreamingCalled = false
+        var prewarmWidth = 0
+        var prewarmHeight = 0
+        var startWidth = 0
+        var startHeight = 0
+
+        override fun prewarm(width: Int, height: Int, fps: Int) {
+            prewarmCalled = true
+            prewarmWidth = width
+            prewarmHeight = height
+        }
+
+        override fun startStreaming(width: Int, height: Int, fps: Int) {
+            startStreamingCalled = true
+            startWidth = width
+            startHeight = height
+            isStreaming.value = true
+        }
+
+        override fun stopStreaming() {
+            stopStreamingCalled = true
+            isStreaming.value = false
+        }
+    }
+
+    @Test
+    fun testVideoPipelinePrewarmedAndStartedSynchronouslyWithVideoConfigConfirm() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val testScope = TestScope(testDispatcher)
+
+        val fakeUsb = FakeUsbAccessoryManager()
+        val logRepo = LogRepositoryImpl()
+        val fakeVideoMgr = FakeTestVideoStreamingManager()
+        val stateMachine = HandshakeStateMachineImpl(
+            usbAccessoryManager = fakeUsb,
+            logRepository = logRepo,
+            scope = testScope,
+            videoStreamingManager = fakeVideoMgr
+        )
+        testScope.advanceUntilIdle()
+
+        stateMachine.startHandshake()
+        testScope.testScheduler.runCurrent()
+
+        // 1. Stereo requests VideoConfig on Port 12346
+        val videoConfigCmd = com.ameer.appradiore.core.protocol.weblink.WebLinkCommand.VideoConfig(
+            sourceWidth = 800,
+            sourceHeight = 480,
+            clientWidth = 800,
+            clientHeight = 480,
+            frameEncoding = 2,
+            encoderParams = "2:maxKeyFrameInterval=60,bitrate=8388608,fps=30"
+        )
+        val videoConfigPayload = com.ameer.appradiore.core.protocol.weblink.WebLinkCodec.encode(videoConfigCmd)
+        val videoConfigPacket = com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapPayload(
+            payload = videoConfigPayload,
+            srcPort = com.ameer.appradiore.core.protocol.mtp.MTPPacket.PORT_VIDEO_CHANNEL,
+            dstPort = com.ameer.appradiore.core.protocol.mtp.MTPPacket.PORT_VIDEO_CHANNEL
+        )
+        fakeUsb.incomingBytes.emit(videoConfigPacket)
+        testScope.testScheduler.runCurrent()
+
+        // Prewarm must be triggered immediately on VideoConfig arrival!
+        assertTrue(fakeVideoMgr.prewarmCalled)
+        assertEquals(800, fakeVideoMgr.prewarmWidth)
+        assertEquals(480, fakeVideoMgr.prewarmHeight)
+        // But streaming transmission should NOT be started yet (waiting for SAC auth)
+        assertFalse(fakeVideoMgr.startStreamingCalled)
+
+        // 2. Complete SAC Auth
+        val authRespPFormat = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
+            com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_AUTH,
+            byteArrayOf(0x00, 0x08, 0x00, 0x03, 0x00, 0x01)
+        )
+        fakeUsb.incomingBytes.emit(com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapControlChannelPayload(authRespPFormat))
+        testScope.testScheduler.runCurrent()
+
+        val endAccReply = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
+            com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_AUTH,
+            byteArrayOf(17, 1)
+        )
+        fakeUsb.incomingBytes.emit(com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapControlChannelPayload(endAccReply))
+        testScope.testScheduler.runCurrent()
+
+        // 3. startStreaming must be called synchronously as VideoConfig Confirm is dispatched!
+        assertTrue(fakeVideoMgr.startStreamingCalled)
+        assertEquals(800, fakeVideoMgr.startWidth)
+        assertEquals(480, fakeVideoMgr.startHeight)
+
+        stateMachine.reset()
+        assertTrue(fakeVideoMgr.stopStreamingCalled)
     }
 }

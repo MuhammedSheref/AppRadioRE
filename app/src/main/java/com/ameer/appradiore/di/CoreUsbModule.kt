@@ -40,7 +40,8 @@ val coreUsbModule = module {
         HandshakeStateMachineImpl(
             usbAccessoryManager = get(),
             logRepository = get(),
-            scope = get()
+            scope = get(),
+            videoStreamingManager = get()
         )
     }
 }
