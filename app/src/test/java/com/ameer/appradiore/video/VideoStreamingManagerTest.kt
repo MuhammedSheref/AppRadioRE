@@ -36,7 +36,7 @@ class VideoStreamingManagerTest {
         override fun requestPermission(accessory: UsbAccessory) {}
         override fun connect(accessory: UsbAccessory) {}
         override fun disconnect() {}
-        override suspend fun send(data: ByteArray): Boolean {
+        override suspend fun send(data: ByteArray, isHighPriority: Boolean): Boolean {
             sentBytes.add(data)
             return true
         }
@@ -146,6 +146,65 @@ class VideoStreamingManagerTest {
             assertEquals(2, fillRect.encodingType)
             assertEquals(0, fillRect.appId)
             assertTrue(sampleH264.contentEquals(fillRect.frameData))
+        } finally {
+            manager.stopStreaming()
+            testScheduler.runCurrent()
+        }
+    }
+
+    @Test
+    fun testPrewarmCachesInitialKeyframeAndDispatchesImmediatelyOnStart() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val testScope = TestScope(testDispatcher)
+        val fakeUsb = FakeUsbAccessoryManager()
+        val logRepo = LogRepositoryImpl()
+        val fakeEncoder = FakeVideoEncoder()
+
+        val manager = VideoStreamingManagerImpl(
+            usbAccessoryManager = fakeUsb,
+            logRepository = logRepo,
+            scope = testScope,
+            ioDispatcher = testDispatcher,
+            encoderFactory = { _, _, _ -> fakeEncoder }
+        )
+
+        try {
+            // 1. Call prewarm: encoder starts, but isStreaming is false and no USB packets sent
+            manager.prewarm(800, 480, 30)
+            testScheduler.runCurrent()
+
+            assertTrue(fakeEncoder.isStarted)
+            assertFalse(manager.isStreaming.value)
+            assertEquals(0, fakeUsb.sentBytes.size)
+
+            // 2. Emit an IDR keyframe during prewarm (e.g. before SAC auth completes)
+            val sampleKeyframe = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00)
+            fakeEncoder.emitFrame(sampleKeyframe)
+            testScheduler.runCurrent()
+
+            // 2b. Emit subsequent P-frames during prewarm: must NOT overwrite the cached keyframe!
+            val samplePFrame = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x41, 0x09)
+            fakeEncoder.emitFrame(samplePFrame)
+            testScheduler.runCurrent()
+
+            // Still 0 packets on USB (traffic held in RAM for preroll)
+            assertEquals(0, fakeUsb.sentBytes.size)
+            assertFalse(manager.isStreaming.value)
+
+            // 3. Now startStreaming is invoked (e.g. when VideoConfig Confirm is sent)
+            manager.startStreaming(800, 480, 30)
+            testScheduler.runCurrent()
+
+            assertTrue(manager.isStreaming.value)
+            // The cached preroll keyframe must have been dispatched immediately!
+            assertEquals(1, fakeUsb.sentBytes.size)
+            assertEquals(1L, manager.framesSent.value)
+
+            // Verify the dispatched frame is the KEYFRAME, NOT the overwritten P-frame!
+            val mtpResult = MTPCodec.decode(fakeUsb.sentBytes[0])
+            val wlCommands = WebLinkCodec.decode(mtpResult.packets[0].payload)
+            val fillRect = wlCommands[0] as WebLinkCommand.FillRectangle
+            assertTrue(sampleKeyframe.contentEquals(fillRect.frameData))
         } finally {
             manager.stopStreaming()
             testScheduler.runCurrent()

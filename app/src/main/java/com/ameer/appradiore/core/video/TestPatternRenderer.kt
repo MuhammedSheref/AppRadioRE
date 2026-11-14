@@ -172,9 +172,14 @@ class TestPatternRenderer(
     private val timeFormat = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
     private val centerCardRect = RectF(160f, 130f, 640f, 350f)
 
-    fun start() {
+    @Volatile
+    private var isPaused = false
+    private val pauseLock = Object()
+
+    fun prewarm() {
         if (isRunning) return
         isRunning = true
+        isPaused = true
         frameCount = 0
 
         renderThread = Thread({
@@ -182,6 +187,26 @@ class TestPatternRenderer(
         }, "TestPatternRendererThread").apply {
             isDaemon = true
             start()
+        }
+    }
+
+    fun start() {
+        if (!isRunning) {
+            isRunning = true
+            isPaused = false
+            frameCount = 0
+
+            renderThread = Thread({
+                runRenderLoop()
+            }, "TestPatternRendererThread").apply {
+                isDaemon = true
+                start()
+            }
+        } else if (isPaused) {
+            isPaused = false
+            synchronized(pauseLock) {
+                pauseLock.notifyAll()
+            }
         }
     }
 
@@ -208,6 +233,16 @@ class TestPatternRenderer(
                 drawFrame(canvas, frameCount)
                 renderToGl(bmp, isFirstFrame = (frameCount == 0L))
                 frameCount++
+
+                if (isPaused) {
+                    synchronized(pauseLock) {
+                        while (isPaused && isRunning) {
+                            pauseLock.wait()
+                        }
+                    }
+                    nextFrameNs = System.nanoTime()
+                    continue
+                }
 
                 nextFrameNs += framePeriodNs
                 val sleepNs = nextFrameNs - System.nanoTime()
@@ -492,6 +527,10 @@ class TestPatternRenderer(
 
     fun stop() {
         isRunning = false
+        isPaused = false
+        synchronized(pauseLock) {
+            pauseLock.notifyAll()
+        }
         renderThread?.interrupt()
         try {
             renderThread?.join(500)

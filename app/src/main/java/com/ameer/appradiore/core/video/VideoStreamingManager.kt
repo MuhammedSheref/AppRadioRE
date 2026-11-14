@@ -37,6 +37,7 @@ interface VideoStreamingManager {
     val framesSent: StateFlow<Long>
     val bytesSent: StateFlow<Long>
 
+    fun prewarm(width: Int = 800, height: Int = 480, fps: Int = 30) {}
     fun startStreaming(width: Int = 800, height: Int = 480, fps: Int = 30)
     fun stopStreaming()
 }
@@ -85,76 +86,18 @@ class VideoStreamingManagerImpl(
     private class EncodedFrame(val frameData: ByteArray, val width: Int, val height: Int)
     private var frameChannel: Channel<EncodedFrame>? = null
     private var frameSenderJob: Job? = null
+    @Volatile
+    private var cachedPrerollFrame: EncodedFrame? = null
 
-    override fun startStreaming(width: Int, height: Int, fps: Int) {
-        if (_isStreaming.value) return
+    override fun prewarm(width: Int, height: Int, fps: Int) {
+        if (activeEncoder != null || _isStreaming.value) return
 
         try {
             logRepository.log(
                 direction = LogDirection.INTERNAL,
                 protocol = ProtocolType.SYSTEM,
-                summary = "Initializing Video Pipeline: ${width}x${height} @ ${fps}fps (H.264)"
+                summary = "Pre-warming Video Pipeline: initializing encoder & renderer ($width x $height @ ${fps}fps)"
             )
-
-            val channel = Channel<EncodedFrame>(capacity = Channel.CONFLATED)
-            frameChannel = channel
-
-            frameSenderJob = scope.launch(ioDispatcher) {
-                for (item in channel) {
-                    if (!_isStreaming.value) break
-                    try {
-                        // 1. Wrap in WebLink FillRectangleCommand (ID 1)
-                        val fillRectangle = WebLinkCommand.FillRectangle(
-                            width = item.width,
-                            height = item.height,
-                            encodingType = 2, // H.264
-                            appId = 0,
-                            frameData = item.frameData
-                        )
-                        val webLinkBytes = WebLinkCodec.encode(fillRectangle)
-
-                        // 2. Wrap in MTP Packet(s) targeting Video Channel (Port 12346), fragmented if > 16,284B
-                        val mtpPackets = MTPCodec.wrapPayloadFragmented(
-                            payload = webLinkBytes,
-                            srcPort = MTPPacket.PORT_VIDEO_CHANNEL,
-                            dstPort = MTPPacket.PORT_VIDEO_CHANNEL
-                        )
-
-                        // 3. Transmit via UsbAccessoryManager
-                        var allSuccess = true
-                        for (packet in mtpPackets) {
-                            val success = usbAccessoryManager.send(packet)
-                            if (!success) {
-                                allSuccess = false
-                                break
-                            }
-                        }
-                        if (allSuccess) {
-                            _framesSent.value++
-                            _bytesSent.value += webLinkBytes.size
-                            framesInCurrentSecond.incrementAndGet()
-                        } else {
-                            logRepository.log(
-                                direction = LogDirection.INTERNAL,
-                                protocol = ProtocolType.SYSTEM,
-                                summary = "USB write failed during video streaming; stopping stream",
-                                isError = true
-                            )
-                            stopStreaming()
-                            break
-                        }
-                    } catch (e: Exception) {
-                        if (_isStreaming.value) {
-                            logRepository.log(
-                                direction = LogDirection.INTERNAL,
-                                protocol = ProtocolType.SYSTEM,
-                                summary = "Video frame send error: ${e.message}",
-                                isError = true
-                            )
-                        }
-                    }
-                }
-            }
 
             val encoder = encoderFactory(width, height, fps)
             activeEncoder = encoder
@@ -182,7 +125,106 @@ class VideoStreamingManagerImpl(
                         }
                     )
                 activeRenderer = renderer
-                renderer.start()
+                renderer.prewarm()
+            }
+        } catch (e: Exception) {
+            logRepository.log(
+                direction = LogDirection.INTERNAL,
+                protocol = ProtocolType.SYSTEM,
+                summary = "Failed to pre-warm video pipeline: ${e.message}",
+                isError = true
+            )
+            stopStreaming()
+        }
+    }
+
+    override fun startStreaming(width: Int, height: Int, fps: Int) {
+        if (_isStreaming.value) return
+
+        try {
+            logRepository.log(
+                direction = LogDirection.INTERNAL,
+                protocol = ProtocolType.SYSTEM,
+                summary = "Initializing Video Pipeline: ${width}x${height} @ ${fps}fps (H.264)"
+            )
+
+            // 1. Ensure encoder and renderer are initialized
+            if (activeEncoder == null) {
+                prewarm(width, height, fps)
+            }
+
+            // 2. Resume / start active renderer for continuous 30 FPS rendering
+            activeRenderer?.start()
+
+            val channel = Channel<EncodedFrame>(capacity = Channel.CONFLATED)
+            frameChannel = channel
+
+            // 3. Dispatch cached preroll keyframe immediately to unblock GStreamer
+            cachedPrerollFrame?.let { prerollFrame ->
+                channel.trySend(prerollFrame)
+                cachedPrerollFrame = null
+            }
+
+            frameSenderJob = scope.launch(ioDispatcher) {
+                for (item in channel) {
+                    if (!_isStreaming.value) break
+                    try {
+                        // 1. Wrap in WebLink FillRectangleCommand (ID 1)
+                        val fillRectangle = WebLinkCommand.FillRectangle(
+                            width = item.width,
+                            height = item.height,
+                            encodingType = 2, // H.264
+                            appId = 0,
+                            frameData = item.frameData
+                        )
+                        val webLinkBytes = WebLinkCodec.encode(fillRectangle)
+
+                        // 2. Wrap in MTP Packet(s) targeting Video Channel (Port 12346), fragmented if > 16,284B
+                        val mtpPackets = MTPCodec.wrapPayloadFragmented(
+                            payload = webLinkBytes,
+                            srcPort = MTPPacket.PORT_VIDEO_CHANNEL,
+                            dstPort = MTPPacket.PORT_VIDEO_CHANNEL
+                        )
+
+                        // 3. Transmit via UsbAccessoryManager
+                        var allSuccess = true
+                        for ((index, packet) in mtpPackets.withIndex()) {
+                            if (mtpPackets.size > 1) {
+                                logRepository.log(
+                                    direction = LogDirection.OUTGOING,
+                                    protocol = ProtocolType.MTP,
+                                    summary = "TX MTP Video Fragment ${index + 1}/${mtpPackets.size} (${packet.size} bytes)"
+                                )
+                            }
+                            val success = usbAccessoryManager.send(packet, isHighPriority = false)
+                            if (!success) {
+                                allSuccess = false
+                                break
+                            }
+                        }
+                        if (allSuccess) {
+                            _framesSent.value++
+                            _bytesSent.value += webLinkBytes.size
+                            framesInCurrentSecond.incrementAndGet()
+                        } else {
+                            logRepository.log(
+                                direction = LogDirection.INTERNAL,
+                                protocol = ProtocolType.SYSTEM,
+                                summary = "Video frame dropped or USB write busy; continuing stream",
+                                isError = false
+                            )
+                        }
+                    } catch (e: Exception) {
+                        if (_isStreaming.value) {
+                            logRepository.log(
+                                direction = LogDirection.INTERNAL,
+                                protocol = ProtocolType.SYSTEM,
+                                summary = "Video frame send error: ${e.message}",
+                                isError = true
+                            )
+                        }
+                    }
+                }
             }
 
             _isStreaming.value = true
@@ -205,8 +247,19 @@ class VideoStreamingManagerImpl(
     }
 
     private fun onH264FrameEncoded(frameData: ByteArray, width: Int, height: Int) {
-        if (!_isStreaming.value) return
-        frameChannel?.trySend(EncodedFrame(frameData, width, height))
+        val frame = EncodedFrame(frameData, width, height)
+        if (!_isStreaming.value) {
+            if (cachedPrerollFrame == null) {
+                cachedPrerollFrame = frame
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SYSTEM,
+                    summary = "Video Pipeline Pre-warmed: Initial H.264 IDR keyframe cached (${frameData.size} bytes) ready for immediate preroll"
+                )
+            }
+            return
+        }
+        frameChannel?.trySend(frame)
     }
 
     private fun startFpsCounter() {
@@ -234,6 +287,7 @@ class VideoStreamingManagerImpl(
         if (!_isStreaming.value && activeEncoder == null) return
 
         _isStreaming.value = false
+        cachedPrerollFrame = null
         frameSenderJob?.cancel()
         frameSenderJob = null
         frameChannel?.close()
