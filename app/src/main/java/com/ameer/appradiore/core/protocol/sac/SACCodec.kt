@@ -115,6 +115,10 @@ object SACCodec {
                 dos.writeShort(cmd.appToken.toInt())
                 dos.writeByte(0)
             }
+            is SACCommand.HdmiSerialResponse -> {
+                dos.writeByte(SACCommand.HdmiSerialResponse.SUBTYPE.toInt())
+                dos.writeByte(if (cmd.isMatch) 1 else 0)
+            }
             is SACCommand.UnknownSACCommand -> {
                 dos.write(cmd.rawPayload)
             }
@@ -149,7 +153,7 @@ object SACCodec {
                 SACCommand.OP_A2S_APPIMAGE_TRANSFER_REQUEST -> decodeAppImageRequest(dis, payload)
                 SACCommand.OP_A2S_REMOTECTRL -> decodeRemoteCtrl(dis, payload)
                 SACCommand.OP_A2S_APPS -> decodeApps(dis, payload)
-                SACCommand.OP_A2S_KEY -> SACCommand.StereoKeyEvent(payload)
+                SACCommand.OP_A2S_KEY -> decodeKey(payload)
                 else -> SACCommand.UnknownSACCommand(opcode, payload)
             }
         } catch (e: Exception) {
@@ -281,6 +285,14 @@ object SACCodec {
                 SACCommand.AppLaunchRequest(launchType = 2, appToken = token)
             }
             else -> SACCommand.UnknownSACCommand(SACCommand.OP_A2S_APPS, raw)
+        }
+    }
+
+    private fun decodeKey(payload: ByteArray): SACCommand {
+        return if (payload.firstOrNull()?.toInt() == 3) {
+            SACCommand.HdmiSerialRequest(payload.copyOfRange(1, minOf(payload.size, 21)))
+        } else {
+            SACCommand.StereoKeyEvent(payload)
         }
     }
 }

@@ -292,6 +292,30 @@ sealed class SACCommand {
         }
     }
 
+    data class HdmiSerialRequest(
+        val serial: ByteArray
+    ) : SACCommand() {
+        override val opcode: Byte = OP_A2S_KEY
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (javaClass != other?.javaClass) return false
+            other as HdmiSerialRequest
+            return serial.contentEquals(other.serial)
+        }
+
+        override fun hashCode(): Int = serial.contentHashCode()
+    }
+
+    data class HdmiSerialResponse(
+        val isMatch: Boolean
+    ) : SACCommand() {
+        override val opcode: Byte = OP_S2A_KEY
+        companion object {
+            const val SUBTYPE: Byte = 3
+        }
+    }
+
     data class RequestPhoneStatus(
         val statusType: Byte = 0x20 // 0x20 = AccessoryStatus/Park, 0x21 = Media
     ) : SACCommand() {

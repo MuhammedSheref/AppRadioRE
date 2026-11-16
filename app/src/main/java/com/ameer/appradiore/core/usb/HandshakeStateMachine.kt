@@ -508,7 +508,6 @@ class HandshakeStateMachineImpl(
                     summary = "Stereo requested SmartPhoneStatus (type: 0x${String.format("%02X", sacCmd.statusType)}). Replying with SmartPhoneStatus..."
                 )
                 sendSacCommand(SACCommand.SmartPhoneStatus(statusType = sacCmd.statusType))
-                sendSacCommand(SACCommand.ScreenTransitionHome)
                 startHeartbeat()
             }
             is SACCommand.EndAccessoryInfoReply -> {
@@ -523,18 +522,9 @@ class HandshakeStateMachineImpl(
                 logRepository.log(
                     direction = LogDirection.INTERNAL,
                     protocol = ProtocolType.SAC,
-                    summary = "Stereo requested App Info. Registering AppRadio launcher..."
+                    summary = "Stereo requested App Info. Acknowledging and waiting for metadata requests..."
                 )
-                // 1. Reply to StartAppInfo
                 sendSacCommand(SACCommand.StartAppInfoReply(status = 1))
-                // 2. Announce App Name for token 1
-                sendSacCommand(SACCommand.AppNameReply(appToken = 1, appName = "AppRadio"))
-                // 3. Announce Package Name for token 1
-                sendSacCommand(SACCommand.PackageNameReply(appToken = 1, packageName = "jp.pioneer.mbg.appradio.AppRadioLauncher"))
-                // 4. End App Info
-                sendSacCommand(SACCommand.EndAppInfoReply(status = 1))
-                // 5. Complete App Accessory handshake
-                sendSacCommand(SACCommand.EndAppAcc)
             }
             is SACCommand.AppInfoRequest -> {
                 _currentStep.value = HandshakeStep.STEP_7_APP_INFO
@@ -650,10 +640,16 @@ class HandshakeStateMachineImpl(
                 )
                 _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
                 _currentStep.value = HandshakeStep.CONNECTED_READY
-                sendSacCommand(SACCommand.ScreenTransitionHome)
-                sendSacCommand(SACCommand.SmartPhoneStatus())
                 startHeartbeat()
                 sendDeferredVideoSetup()
+            }
+            is SACCommand.HdmiSerialRequest -> {
+                logRepository.log(
+                    direction = LogDirection.INTERNAL,
+                    protocol = ProtocolType.SAC,
+                    summary = "Stereo provided HDMI serial (${sacCmd.serial.size} bytes). Acknowledging without a stored CMK."
+                )
+                sendSacCommand(SACCommand.HdmiSerialResponse(isMatch = false))
             }
             is SACCommand.StereoKeyEvent -> {
                 logRepository.log(
@@ -663,8 +659,6 @@ class HandshakeStateMachineImpl(
                 )
                 _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
                 _currentStep.value = HandshakeStep.CONNECTED_READY
-                sendSacCommand(SACCommand.ScreenTransitionHome)
-                sendSacCommand(SACCommand.SmartPhoneStatus())
             }
             is SACCommand.AppLaunchRequest -> {
                 logRepository.log(
@@ -674,8 +668,6 @@ class HandshakeStateMachineImpl(
                 )
                 _stereoSpecs.value = _stereoSpecs.value.copy(isReadyForVideo = true)
                 _currentStep.value = HandshakeStep.CONNECTED_READY
-                sendSacCommand(SACCommand.ScreenTransitionHome)
-                sendSacCommand(SACCommand.SmartPhoneStatus())
             }
             is SACCommand.VideoOutputRequest -> {
                 logRepository.log(

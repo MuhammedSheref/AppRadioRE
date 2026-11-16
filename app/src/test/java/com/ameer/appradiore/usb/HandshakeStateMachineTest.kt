@@ -2,6 +2,7 @@ package com.ameer.appradiore.usb
 
 import android.hardware.usb.UsbAccessory
 import com.ameer.appradiore.core.logging.LogRepositoryImpl
+import com.ameer.appradiore.core.protocol.sac.SACCommand
 import com.ameer.appradiore.core.usb.HandshakeStateMachineImpl
 import com.ameer.appradiore.core.usb.HandshakeStep
 import com.ameer.appradiore.core.usb.UsbAccessoryManager
@@ -54,6 +55,62 @@ class HandshakeStateMachineTest {
 
         assertEquals(HandshakeStep.DISCONNECTED, stateMachine.currentStep.value)
         assertEquals(0, stateMachine.stereoSpecs.value.width)
+    }
+
+    @Test
+    fun testStartAppInfoWaitsForHeadUnitMetadataRequests() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val testScope = TestScope(testDispatcher)
+        val fakeUsb = FakeUsbAccessoryManager()
+        val stateMachine = HandshakeStateMachineImpl(fakeUsb, LogRepositoryImpl(), testScope)
+        testScope.advanceUntilIdle()
+
+        stateMachine.startHandshake()
+        testScope.testScheduler.runCurrent()
+
+        val startAppInfo = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
+            com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_AUTH,
+            byteArrayOf(18)
+        )
+        fakeUsb.incomingBytes.emit(
+            com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapControlChannelPayload(startAppInfo)
+        )
+        testScope.testScheduler.runCurrent()
+
+        val reply = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.decode(
+            com.ameer.appradiore.core.protocol.mtp.MTPCodec.decode(fakeUsb.sentBytes.last()).packets.single().payload
+        ).single()
+        assertEquals(SACCommand.OP_S2A_AUTH, reply.commandId)
+        assertEquals(listOf<Byte>(18, 1), reply.payload.toList())
+        stateMachine.reset()
+    }
+
+    @Test
+    fun testPhoneStatusRequestDoesNotSendScreenTransition() = runTest {
+        val testDispatcher = StandardTestDispatcher(testScheduler)
+        val testScope = TestScope(testDispatcher)
+        val fakeUsb = FakeUsbAccessoryManager()
+        val stateMachine = HandshakeStateMachineImpl(fakeUsb, LogRepositoryImpl(), testScope)
+        testScope.advanceUntilIdle()
+
+        stateMachine.startHandshake()
+        testScope.testScheduler.runCurrent()
+
+        val statusRequest = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.encode(
+            com.ameer.appradiore.core.protocol.sac.SACCommand.OP_A2S_NOTIFYREQUEST,
+            byteArrayOf(0x20)
+        )
+        fakeUsb.incomingBytes.emit(
+            com.ameer.appradiore.core.protocol.mtp.MTPCodec.wrapControlChannelPayload(statusRequest)
+        )
+        testScope.testScheduler.runCurrent()
+
+        val reply = com.ameer.appradiore.core.protocol.pformat.PFormatCodec.decode(
+            com.ameer.appradiore.core.protocol.mtp.MTPCodec.decode(fakeUsb.sentBytes.last()).packets.single().payload
+        ).single()
+        assertEquals(SACCommand.OP_S2A_NOTIFICATION, reply.commandId)
+        assertEquals(listOf<Byte>(0x20, 0x02, 0x01, 0x00, 0x00, 0x01, 0x00), reply.payload.toList())
+        stateMachine.reset()
     }
 
     @Test

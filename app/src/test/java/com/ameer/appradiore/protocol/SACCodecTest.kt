@@ -130,4 +130,24 @@ class SACCodecTest {
         assertTrue(decoded is SACCommand.RequestPhoneStatus)
         assertEquals(0x20.toByte(), (decoded as SACCommand.RequestPhoneStatus).statusType)
     }
+
+    @Test
+    fun testDecodeHdmiSerialRequest() {
+        val serial = byteArrayOf(0x01, 0x23, 0x45, 0x67)
+        val decoded = SACCodec.decode(
+            SACCommand.OP_A2S_KEY,
+            byteArrayOf(0x03) + serial
+        )
+
+        assertTrue(decoded is SACCommand.HdmiSerialRequest)
+        assertArrayEquals(serial, (decoded as SACCommand.HdmiSerialRequest).serial)
+    }
+
+    @Test
+    fun testEncodeHdmiSerialResponse() {
+        assertArrayEquals(
+            byteArrayOf(0x03, 0x00),
+            SACCodec.encode(SACCommand.HdmiSerialResponse(isMatch = false))
+        )
+    }
 }
